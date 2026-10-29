@@ -1,191 +1,227 @@
-"""
-Port of CreamInstaller/Resources/SmokeAPI.cs (install/uninstall/config generation),
-using this repo's own vendored SmokeAPI DLLs (decky/resources/SmokeAPI/) instead of
-a runtime download — the exact same binaries CreamInstaller embeds as .NET assembly
-resources, just read from disk instead of an assembly manifest.
-"""
+"""One-game SmokeAPI transactions with a durable settings journal."""
 from __future__ import annotations
 
-import asyncio
+import fnmatch
 import json
-import os
-import shutil
-from typing import Iterable, Optional
+import stat
+import uuid
 
-import decky
-from bitness import is_64_bit
-from resource_files import resource_path
+from safe_fs import Directory, app_id, digest
+from install_state import APIS, CONFIG, LOCK, PROXIES, launch_options
+from resource_files import verified_resources
+from steam_library import assert_game_idle
 
-# Same three proxy DLL choices CreamInstaller offers (Resources/SmokeAPI.cs ProxyDLLs);
-# a proxy is used instead of replacing steam_api(64).dll directly, for games that dislike
-# having their own steam_api swapped out.
-PROXY_DLL_NAMES = ["winmm", "winhttp", "version"]
+CHANGED = "game changed since install, run Verify integrity in Steam"
 
 
-def _proxy_state_path(directory: str) -> str:
-    # Tracks which proxy filename we wrote, since (unlike CreamInstaller) this port has no
-    # embedded-resource MD5 list to recognize "is this file one of ours" for cleanup.
-    return os.path.join(directory, ".dlc_unlocker_proxy.json")
+def anti_cheat(directory):
+    def scan(folder, depth):
+        for name, info in folder.entries():
+            lower = name.casefold()
+            if (lower in {"easyanticheat", "easyanticheat_x64.dll", "easyanticheat_eos_setup.exe",
+                          "battleye", "beclient_x64.dll", "start_protected_game.exe"}
+                    or fnmatch.fnmatchcase(lower, "beservice*.exe")):
+                raise ValueError(f"Anti-cheat marker found: {name}")
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError(f"Symlink in game scan: {name}")
+            if depth and stat.S_ISDIR(info.st_mode):
+                with folder.child(name) as child:
+                    scan(child, depth - 1)
+    scan(directory, 1)
 
 
-def _proxy_dll_path(directory: str, proxy_dll: str) -> str:
-    return os.path.join(directory, f"{proxy_dll}.dll")
+class Installer:
+    def __init__(self, store, find_game):
+        self.store = store
+        self.find_game = find_game
 
+    def install(self, value, mode, proxy, enabled, original_launch, manual_launch=False):
+        with LOCK:
+            value = app_id(value)
+            records = self.store.all()
+            if any(r["app_id"] == value and r["launch_restore"] == "pending" for r in records):
+                raise ValueError("Launch options restoration is pending. Restore them or explicitly resolve by hand first")
+            if any(r["phase"] != "removed" for r in records):
+                raise ValueError("Remove or recover the recorded installation first. Only one game at a time")
+            if value not in self.store.allowlist():
+                raise ValueError("Game is not on the owner allowlist")
+            if mode not in ("direct", "proxy") or proxy not in PROXIES:
+                raise ValueError("Invalid SmokeAPI mode or proxy")
+            if not isinstance(enabled, list) or len(enabled) > 1000:
+                raise ValueError("Invalid DLC list")
+            enabled = sorted({app_id(x) for x in enabled})
+            if not isinstance(original_launch, str) or len(original_launch) > 8192:
+                raise ValueError("Invalid original launch options")
+            try:
+                desired = launch_options(original_launch, proxy) if mode == "proxy" else None
+            except ValueError:
+                if manual_launch is not True:
+                    raise
+                desired = None
+            game = self.find_game(value)
+            assert_game_idle(game)
+            resources = verified_resources()
+            with Directory(game["game_directory"]) as directory:
+                anti_cheat(directory)
+                directory.rename_preflight()
+                originals = {name: directory.hash(name) for name in APIS if directory.exists(name)}
+                if not originals:
+                    raise ValueError("No top-level Windows Steam API DLL. Use the Proton game build")
+                for name in (*[x.replace(".dll", "_o.dll") for x in APIS], CONFIG,
+                             *(x + ".dll" for x in PROXIES), ".dlc_unlocker_proxy.json"):
+                    if directory.exists(name):
+                        raise ValueError(f"Foreign file already exists: {name}")
+                config = {"$version": 4, "logging": False, "log_steam_http": False,
+                          "default_app_status": "original", "override_app_status": {},
+                          "override_dlc_status": {x: "unlocked" for x in enabled},
+                          "auto_inject_inventory": False, "extra_inventory_items": [], "extra_dlcs": {}}
+                payload = {CONFIG: json.dumps(config, indent=2).encode()}
+                if mode == "direct":
+                    payload.update({name: resources[name] for name in originals})
+                    created = [x.replace(".dll", "_o.dll") for x in originals] + [CONFIG]
+                else:
+                    if len(originals) != 1:
+                        raise ValueError("Ambiguous proxy architecture. Use direct mode")
+                    payload[proxy + ".dll"] = resources[next(iter(originals))]
+                    created = list(payload)
+                record = {"schema": 1, "app_id": value, "game_dir": game["game_directory"],
+                          "mode": mode, "proxy_name": proxy, "originals": originals,
+                          "installed": {name: digest(data) for name, data in payload.items()},
+                          "created": created, "stages": {name: ".cdh-" + uuid.uuid4().hex for name in payload},
+                          "phase": "installing", "original_launch_options": original_launch,
+                          "set_launch_options": desired, "enabled_dlc_ids": enabled,
+                          "quarantine": {}, "launch_restore": "acknowledged"}
+                self.store.save(record)
+                directory.bind_journal(record, self.store.save)
+                try:
+                    for name, data in payload.items():
+                        directory.write_new(record["stages"][name], data)
+                    if any(directory.hash(name) != sha for name, sha in originals.items()):
+                        raise ValueError("Original DLL changed while staging")
+                    assert_game_idle(self.find_game(value), ignored_fds=(getattr(directory, "fd", None),))
+                    if mode == "direct":
+                        for name, sha in originals.items():
+                            directory.rename(name, name.replace(".dll", "_o.dll"), sha)
+                    for name, sha in record["installed"].items():
+                        directory.rename(record["stages"][name], name, sha)
+                    record["phase"] = "installed"
+                    self.store.save(record)
+                except BaseException:
+                    self._remove(record, directory, rollback=True)
+                    raise
+                return record
 
-def _api32_path(directory: str) -> str:
-    return os.path.join(directory, "steam_api.dll")
+    def status(self, value):
+        with LOCK:
+            self.store.all()
+            record = self.store.load(app_id(value))
+            if not record or record["phase"] == "removed":
+                return "not installed", record
+            game = self.find_game(value)
+            if game["game_directory"] != record["game_dir"]:
+                return "game directory changed", record
+            with Directory(record["game_dir"]) as directory:
+                if record["phase"] != "installed":
+                    return "interrupted operation; use Remove / recover", record
+                for name, sha in record["installed"].items():
+                    if directory.hash(name) != sha:
+                        return CHANGED, record
+                for name, sha in record["originals"].items():
+                    check = name.replace(".dll", "_o.dll") if record["mode"] == "direct" else name
+                    if directory.hash(check) != sha:
+                        return CHANGED, record
+            return "installed", record
 
+    def uninstall(self, value):
+        with LOCK:
+            self.store.all()
+            record = self.store.load(app_id(value))
+            if not record:
+                raise ValueError("No valid install record. No files were removed")
+            if record["phase"] == "removed":
+                return record, []
+            game = self.find_game(value)
+            if game["game_directory"] != record["game_dir"]:
+                raise ValueError("Manifest game directory changed. Inspect the record manually")
+            assert_game_idle(game)
+            with Directory(record["game_dir"]) as directory:
+                warnings = self._remove(record, directory)
+            return record, warnings
 
-def _api32_backup_path(directory: str) -> str:
-    return os.path.join(directory, "steam_api_o.dll")
+    def resolve_launch(self, value, manual=False):
+        with LOCK:
+            self.store.all()
+            record = self.store.load(app_id(value))
+            if not record or record["phase"] not in ("removing", "removed"):
+                raise ValueError("Remove game files before resolving launch restoration")
+            if type(manual) is not bool:
+                raise ValueError("Explicit manual resolution choice required")
+            record["launch_restore"] = "manual" if manual else "acknowledged"
+            self.store.save(record)
+            return record
 
-
-def _api64_path(directory: str) -> str:
-    return os.path.join(directory, "steam_api64.dll")
-
-
-def _api64_backup_path(directory: str) -> str:
-    return os.path.join(directory, "steam_api64_o.dll")
-
-
-def _config_path(directory: str) -> str:
-    return os.path.join(directory, "SmokeAPI.config.json")
-
-
-def _bundled_dlls() -> tuple[str, str]:
-    """Returns (steam_api.dll path, steam_api64.dll path) from the plugin's vendored resources."""
-    return resource_path("SmokeAPI", "steam_api.dll"), resource_path("SmokeAPI", "steam_api64.dll")
-
-
-def _write_config(directory: str, disabled_dlc_ids: Iterable[str]) -> None:
-    config = {
-        "$version": 4,
-        "logging": False,
-        "log_steam_http": False,
-        "default_app_status": "unlocked",
-        "override_app_status": {},
-        "override_dlc_status": {dlc_id: "locked" for dlc_id in disabled_dlc_ids},
-        "auto_inject_inventory": True,
-        "extra_inventory_items": [],
-        "extra_dlcs": {},
-    }
-    with open(_config_path(directory), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-
-
-async def install(directory: str, all_dlc_ids: list[str], enabled_dlc_ids: list[str]) -> None:
-    api32, api64 = _bundled_dlls()
-
-    def _install() -> None:
-        if os.path.isfile(_api32_path(directory)) and not os.path.isfile(_api32_backup_path(directory)):
-            os.rename(_api32_path(directory), _api32_backup_path(directory))
-        if os.path.isfile(_api32_backup_path(directory)):
-            shutil.copyfile(api32, _api32_path(directory))
-
-        if os.path.isfile(_api64_path(directory)) and not os.path.isfile(_api64_backup_path(directory)):
-            os.rename(_api64_path(directory), _api64_backup_path(directory))
-        if os.path.isfile(_api64_backup_path(directory)):
-            shutil.copyfile(api64, _api64_path(directory))
-
-        disabled = [dlc_id for dlc_id in all_dlc_ids if dlc_id not in enabled_dlc_ids]
-        _write_config(directory, disabled)
-
-    await asyncio.get_event_loop().run_in_executor(None, _install)
-    decky.logger.info(f"[SmokeAPI] Installed to {directory} ({len(enabled_dlc_ids)}/{len(all_dlc_ids)} DLC enabled)")
-
-
-async def uninstall(directory: str) -> None:
-    def _uninstall() -> None:
-        if os.path.isfile(_api32_backup_path(directory)):
-            if os.path.isfile(_api32_path(directory)):
-                os.remove(_api32_path(directory))
-            os.rename(_api32_backup_path(directory), _api32_path(directory))
-
-        if os.path.isfile(_api64_backup_path(directory)):
-            if os.path.isfile(_api64_path(directory)):
-                os.remove(_api64_path(directory))
-            os.rename(_api64_backup_path(directory), _api64_path(directory))
-
-        if os.path.isfile(_config_path(directory)):
-            os.remove(_config_path(directory))
-
-    await asyncio.get_event_loop().run_in_executor(None, _uninstall)
-    decky.logger.info(f"[SmokeAPI] Uninstalled from {directory}")
-
-
-async def proxy_install(
-    directory: str,
-    all_dlc_ids: list[str],
-    enabled_dlc_ids: list[str],
-    proxy_dll: str = "winmm",
-) -> None:
-    if proxy_dll not in PROXY_DLL_NAMES:
-        raise ValueError(f"Unknown proxy DLL: {proxy_dll}")
-    api32, api64 = _bundled_dlls()
-    source_dll = api64 if is_64_bit(directory) else api32
-
-    def _install() -> None:
-        target = _proxy_dll_path(directory, proxy_dll)
-        if os.path.isfile(target) and not os.path.isfile(_proxy_state_path(directory)):
-            raise RuntimeError(f"A non-SmokeAPI {proxy_dll}.dll already exists in this directory")
-
-        # Remove any previous proxy install under a different filename first.
-        if os.path.isfile(_proxy_state_path(directory)):
-            with open(_proxy_state_path(directory), "r", encoding="utf-8") as f:
-                previous = json.load(f).get("proxy_dll")
-            if previous and previous != proxy_dll:
-                previous_path = _proxy_dll_path(directory, previous)
-                if os.path.isfile(previous_path):
-                    os.remove(previous_path)
-
-        shutil.copyfile(source_dll, target)
-        with open(_proxy_state_path(directory), "w", encoding="utf-8") as f:
-            json.dump({"proxy_dll": proxy_dll}, f)
-
-        disabled = [dlc_id for dlc_id in all_dlc_ids if dlc_id not in enabled_dlc_ids]
-        _write_config(directory, disabled)
-
-    await asyncio.get_event_loop().run_in_executor(None, _install)
-    decky.logger.info(
-        f"[SmokeAPI] Proxy-installed ({proxy_dll}.dll) to {directory} "
-        f"({len(enabled_dlc_ids)}/{len(all_dlc_ids)} DLC enabled)"
-    )
-
-
-async def proxy_uninstall(directory: str) -> None:
-    def _uninstall() -> None:
-        state_path = _proxy_state_path(directory)
-        if os.path.isfile(state_path):
-            with open(state_path, "r", encoding="utf-8") as f:
-                proxy_dll = json.load(f).get("proxy_dll")
-            if proxy_dll:
-                proxy_path = _proxy_dll_path(directory, proxy_dll)
-                if os.path.isfile(proxy_path):
-                    os.remove(proxy_path)
-            os.remove(state_path)
-
-        if os.path.isfile(_config_path(directory)):
-            os.remove(_config_path(directory))
-
-    await asyncio.get_event_loop().run_in_executor(None, _uninstall)
-    decky.logger.info(f"[SmokeAPI] Proxy-uninstalled from {directory}")
-
-
-def get_active_proxy_dll(directory: str) -> Optional[str]:
-    state_path = _proxy_state_path(directory)
-    if not os.path.isfile(state_path):
-        return None
-    with open(state_path, "r", encoding="utf-8") as f:
-        return json.load(f).get("proxy_dll")
-
-
-def is_installed(directory: str) -> bool:
-    # CreamAPI backs up the original DLL under this exact same filename, so a bare
-    # backup-file check can't tell the two apart — SmokeAPI's own config file is
-    # the one marker that's actually unique to it.
-    return (
-        os.path.isfile(_config_path(directory))
-        or get_active_proxy_dll(directory) is not None
-    )
-
-
+    def _remove(self, record, directory, rollback=False):
+        # Rollback also rechecks for writers. Only our own directory handle
+        # is exempt; its presence is inherent to descriptor-relative cleanup.
+        game = self.find_game(record["app_id"])
+        if game["game_directory"] != record["game_dir"]:
+            raise ValueError("Manifest game directory changed. Inspect the record manually")
+        assert_game_idle(game, ignored_fds=(getattr(directory, "fd", None),))
+        directory.bind_journal(record, self.store.save)
+        record["launch_restore"] = "pending"
+        self.store.save(record)
+        warnings = directory.recover_quarantine()
+        # Check remaining names before starting fresh mutations.
+        names = set(record["installed"]) | set(record["created"]) | set(record["stages"].values())
+        hashes = {name: directory.hash(name) for name in names}
+        previous = record["phase"]
+        record["phase"] = "removing"
+        self.store.save(record)
+        def mutate(function, *args):
+            try:
+                function(*args)
+                return True
+            except (ValueError, FileNotFoundError) as error:
+                warnings.append(str(error))
+                return False
+        if record["mode"] == "direct":
+            for name, original in record["originals"].items():
+                backup = name.replace(".dll", "_o.dll")
+                installed = record["installed"][name]
+                stage = record["stages"][name]
+                current, saved = hashes[name], hashes[backup]
+                if saved == original and current == installed and hashes[stage] is None:
+                    if mutate(directory.rename, name, stage, installed):
+                        if mutate(directory.rename, backup, name, original):
+                            mutate(directory.delete, stage, installed)
+                elif saved == original and current is None and (
+                        previous == "installing" or hashes[stage] == installed):
+                    # A staged installed DLL proves an interrupted removal.
+                    mutate(directory.rename, backup, name, original)
+                elif saved is None and current == original:
+                    pass
+                else:
+                    warnings.append(CHANGED + f" ({name}); DLL and backup left alone")
+        for name, installed in record["installed"].items():
+            if record["mode"] == "direct" and name in record["originals"]:
+                continue
+            current = hashes[name]
+            if current == installed:
+                mutate(directory.delete, name, installed)
+            elif current is not None:
+                warnings.append(CHANGED + f" ({name}); file left alone")
+        for name, stage in record["stages"].items():
+            current = directory.hash(stage)
+            if current == record["installed"][name]:
+                mutate(directory.delete, stage, current)
+            elif current is not None:
+                warnings.append(f"Unrecognized staging file left alone: {stage}")
+        record["phase"] = "removing" if warnings or record["quarantine"] else "removed"
+        try:
+            self.store.save(record)
+        except OSError:
+            if not rollback:
+                raise
+        if rollback and warnings:
+            raise RuntimeError("Install rollback needs recovery: " + "; ".join(warnings))
+        return warnings

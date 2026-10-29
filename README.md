@@ -1,119 +1,90 @@
-# CreamDeck
+# CreamDeck Hardened
 
-[![PR Build & Test](https://img.shields.io/github/actions/workflow/status/Qiming-Liu/CreamDeck/pr-build-test.yml?branch=main&label=build)](https://github.com/Qiming-Liu/CreamDeck/actions/workflows/pr-build-test.yml)
-[![License: GPL 3.0](https://img.shields.io/github/license/Qiming-Liu/CreamDeck)](./LICENSE)
+A SmokeAPI-only Decky plugin for one owner-approved offline Proton game at a time, intended for a Legion Go 2 running SteamOS.
 
-CreamDeck is a [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin for unlocking installed PC game DLC (via SmokeAPI, CreamAPI, ScreamAPI, Uplay R1/R2 Unlocker, or Koaloader) directly on your Deck — a port of [CreamInstaller](https://github.com/FroggMaster/CreamInstaller)'s core DLC-selection and install/uninstall flow, focused on the one storefront that's already running through Proton on-device.
+This fork keeps the GPL-3.0 license and credits Qiming-Liu's [upstream CreamDeck](https://github.com/Qiming-Liu/CreamDeck), based on commit `242a6147`.
+CreamInstaller by FroggMaster supplied the upstream install approach. SmokeAPI is by acidicoala. The library-menu patch derives from CheatDeck and decky-steamgriddb.
 
-![CreamDeck's per-game page, listing Street Fighter 6's DLC with SmokeAPI selected](docs/screenshot.png)
+## Scope and remaining verification
 
-## Installation
+| Kept | Removed and reason |
+|---|---|
+| Bundled SmokeAPI, direct or proxy mode | CreamAPI, ScreamAPI, Uplay R1, Uplay R2 and Koaloader to reduce code and binary scope |
+| HTTPS DLC metadata | SteamCMD download, extraction and execution to remove executable downloads |
+| Decky user permissions | Root flag and privileged development script to contain filesystem access |
+| Per-app settings journals | Game-local proxy state and config-based detection to prevent unsafe cleanup |
 
-1. Enable Developer Mode in Decky Loader.
-2. Download `CreamDeck.zip` from the [latest release](https://github.com/Qiming-Liu/CreamDeck/releases/latest).
-3. Install the ZIP through Decky Loader's developer settings.
+No device installation or game launch has been performed for this fork.
+The DLL pins match the upstream CreamDeck snapshot. Matching an official SmokeAPI release is still pending; see `resources/SmokeAPI/PROVENANCE.md`.
+The opaque DLLs' network behavior, configuration compatibility and credential access are unverified.
 
-> [!IMPORTANT]
-> Download **`CreamDeck.zip`**, not GitHub's automatically generated **`Source code.zip`**. The source archive does not contain the packaged Decky plugin.
+## Owner allowlist
 
-## Usage
+The allowlist starts empty. The owner must confirm that the current game is offline single-player with no anti-cheat, then choose **Add this game to owner allowlist**.
+Never add an online game, including one that offers an offline mode. A marker scan cannot establish that a game is safe.
+The backend independently requires this allowlist and rejects EAC/BattlEye markers in the first two directory levels, ignoring case.
+Only one active or unresolved install record is permitted across all games. Remove or manually recover that installation before installing another.
 
-1. In your game library, right-click any installed game.
-2. Choose **CreamDeck** from the context menu.
-3. Pick an unlocker — CreamDeck flags which ones it detected a target file for in that game's install directory, but you can pick any of them.
-4. For unlockers with a DLC list (see the table below), check/uncheck which DLC to unlock.
-5. Click **Install**. To change anything afterwards, **Uninstall** first, then reconfigure and install again.
+## Install the reviewed ZIP
 
-> [!NOTE]
-> An unlocker only spoofs the platform's *ownership check* — it does not download DLC content. If a DLC's actual files were never downloaded (because your account doesn't own it), unlocking it will make the game think it owns content it can't actually load, which can crash on launch. This does **not** apply to every DLC on every game, though: some games (Risk of Rain 2 among them — see [Tested games](#tested-games)) ship all DLC content in the base install for everyone, specifically so mixed-ownership multiplayer lobbies work — for those, a full **Verify integrity of game files** in the client (see [Troubleshooting](#troubleshooting)) is enough to have the content locally even without owning it.
->
-> CreamDeck flags exactly which DLC this applies to: any DLC listed with a **⚠** has its own depot on Steam (the same data [SteamDB's "Depots" tab](https://steamdb.info/app/394360/depots/) for a game shows), meaning it ships actual content files rather than just an ownership flag — unlocking it is more likely to need those files already present to actually work.
+1. Complete review and Linux verification before putting this fork on the device. Retain an independent copy of the selected game's clean DLLs, saves and exact launch options.
+2. Verify `out/CreamDeckHardened.zip` against `out/SHA256SUMS` on the build machine. The checksum file also covers every ZIP member after extraction.
+3. Enable Decky's developer options and use **Install from ZIP** to select the archive. If the installed Decky build offers a URL installer only, use its documented local ZIP installation method instead.
+4. Confirm the installed entry is **CreamDeck Hardened**. Its package folder is `CreamDeckHardened`, distinct from upstream `CreamDeck`.
+5. Close the selected game. Open its library menu, select **CreamDeck Hardened**, confirm the owner rule, and add it to the allowlist.
+6. Select the available DLC and install SmokeAPI. Zero DLC is valid; the plugin never downloads DLC content. Only enable content whose files are already present.
 
-CreamDeck's own UI follows your Steam client's language setting — it shows Chinese when Steam is set to Simplified or Traditional Chinese, and English otherwise.
-
-### Unlockers
-
-| Unlocker | Target file | DLC list? |
-|---|---|---|
-| SmokeAPI | `steam_api(64).dll` | Yes |
-| CreamAPI | `steam_api(64).dll` | Yes |
-| ScreamAPI | `EOSSDK-Win32/64-Shipping.dll` | No — unlocks everything |
-| Uplay R1 Unlocker | `uplay_r1_loader(64).dll` | No — unlocks everything |
-| Uplay R2 Unlocker | `upc_r2_loader(64).dll` | No — unlocks everything |
-| Koaloader | a proxy DLL of your choice (version/winmm/winhttp/dxgi/d3d9/d3d10/d3d11/dinput8) | Only when auto-loading SmokeAPI |
-
-SmokeAPI and CreamAPI target the exact same file — they're alternatives, not both installed at once. ScreamAPI (Epic Online Services) and the two Uplay unlockers only lack a DLC list because that would require also scanning the Epic/Ubisoft stores, which this plugin doesn't do; see [Scope](#scope) below.
-
-### Proxy mode
-
-SmokeAPI, CreamAPI, and Koaloader can install as a proxy DLL instead of replacing the unlocker's target file directly — useful if a game doesn't get along with a direct replacement, and the only mode that survives a **Verify integrity of game files** (see [Troubleshooting](#troubleshooting)). Toggle **Use a proxy DLL** on the game's CreamDeck page and pick a filename.
-
-> [!IMPORTANT]
-> Proxy mode needs one extra step that's specific to Proton: Wine ships its own built-in `winmm.dll`/`version.dll`/`winhttp.dll` and prefers those over the one CreamDeck drops into the game folder, so **the unlocker's hook silently never runs** unless this game's launch options tell Proton to prefer the dropped-in file (`WINEDLLOVERRIDES="<dll>=n,b" %command%`). The symptom is the game launching fine with DLC still locked, no error at all. CreamDeck's Proxy mode section has a **Set launch option for `<dll>`.dll** button that reads and updates this game's launch options for you (via the client's own app-management API) without disturbing anything else already set there — you still need to fully close and relaunch the game afterward for it to take effect.
-
-## Scope
-
-CreamDeck v1 only covers **games running through Proton, installed via the one storefront already present on a Deck out of the box**. It does not (yet) support:
-
-- Epic/Ubisoft games via Heroic Games Launcher
-- Native-Linux-build games (a different unlock mechanism entirely — LD_PRELOAD — that acidicoala's Windows DLLs can't do)
-- A library-wide batch scan — each game's DLC list is fetched on demand when you open its CreamDeck page, not up front
-
-## Tested games
-
-### Risk of Rain 2
-
-1. Open the game's CreamDeck page, pick **SmokeAPI**.
-2. Enable **Use a proxy DLL**, pick `version`, then click **Set launch option for version.dll** (see [Proxy mode](#proxy-mode)) — required on Proton or the unlock silently never applies.
-3. If you haven't already, run **Verify integrity of game files** once before installing — Risk of Rain 2 ships all DLC content in the base install for everyone, so this alone is enough to have it locally even without owning it (see the note in [Usage](#usage)).
-4. Check the DLC you want unlocked and click **Install**.
-5. Fully close and relaunch the game (a launch-options change only takes effect on a fresh launch).
-
-Confirmed working: game launches clean, DLC shows unlocked in-game, survives a later **Verify integrity** without needing to redo the launch-option step (only a reinstall through CreamDeck, since verify always undoes the DLL swap itself).
-
-### Street Fighter 6
-
-1. Open the game's CreamDeck page, pick **SmokeAPI**.
-2. Enable **Use a proxy DLL**, pick **version.dll**, then click **Set launch option for version.dll** (see [Proxy mode](#proxy-mode)) — required on Proton or the unlock silently never applies.
-3. Check the DLC you want unlocked and click **Install**.
-4. Fully close and relaunch the game (a launch-options change only takes effect on a fresh launch).
-
-Confirmed working: game launches clean, DLC unlocked in-game.
-
-## Troubleshooting
-
-- **Game launches fine but DLC is still locked, no error shown** — almost always the Proton/WINEDLLOVERRIDES issue described in [Proxy mode](#proxy-mode) above, if you're using proxy mode. Use the **Set launch option** button on the game's CreamDeck page, then fully close and relaunch the game.
-- **Game crashes on launch after installing** — check whether the DLC you enabled actually has its content downloaded (see the note in [Usage](#usage)); if so, disable that DLC and try again with just the ones whose content you know is present.
-- **"Integrity check failed" banner** — CreamDeck's saved record of what's installed doesn't match what's actually on this game's files. This is expected after a **Verify integrity of game files** restores a direct-replace install's original DLL (the client has no reason to also clean up the unlocker's leftover config file, so CreamDeck still sees it and gets confused) — CreamDeck resolves this on its own when it can tell for certain nothing's installed anymore. If it can't (files show something *different* from what CreamDeck expects), use the **Remove all unlocker files** button on that banner to reset cleanly, then reinstall.
-- **After Verify integrity**, a direct-replace (non-proxy) install is always undone — the client restores the original DLL as part of verifying, same as after most game updates. Reinstall through CreamDeck afterward, or switch to Proxy mode with the launch option set so it survives future verifies/updates.
-- If DLCs still aren't recognized after installing, try **Proxy mode** with a different DLL name.
-- If a game's DLC list fails to fetch, it's retried automatically the next time you open that game's page.
-- Antivirus software may flag the vendored unlocker DLLs — see [CreamInstaller's false-positive explanation](https://github.com/FroggMaster/CreamInstaller#false-positive-antivirus-detections) for why (DLL replacement + process hooking read as suspicious to heuristic scanners even when benign).
-- For anything else, check `creamdeck_actions.log` in Decky's plugin log directory (`~/homebrew/logs/CreamDeck/`) — every install/uninstall/page-load action is logged there with its arguments, outcome, and the plugin version, separate from Decky's own per-session log files.
-
-## Development
-
-See [`.github/workflows/`](.github/workflows) for the CI that build/type-checks the frontend and runs the backend's unit tests on every PR, and [`pull_request_template.md`](.github/pull_request_template.md) for what's expected before merging a fix.
-
-```bash
-pnpm install
-pnpm run build
-python -m unittest discover -s tests -v
+```mermaid
+flowchart LR
+    A[Reviewed ZIP] --> B[Decky installation]
+    B --> C[Owner confirmation]
+    C --> D[Staged game install]
+    D --> E[Hash-checked removal]
 ```
 
-### Live testing on a Deck
+## Modes and launch options
 
-`scripts/dev.sh` turns this Deck into its own live test device: it symlinks `dist/`, `py_modules/`, and `main.py` from the plugin's installed location back into this repo, and runs a `rollup -c -w` watcher alongside a background poller that restarts `plugin_loader` automatically once backend changes settle (neither the frontend nor the backend reliably hot-reload an already-open plugin page here on their own). Needs `sudo` once at startup, kept alive for the rest of the session.
+| Mode | Behavior |
+|---|---|
+| Direct | Original top-level Steam API DLLs are renamed to `_o.dll` backups before installing replacements |
+| Proxy | A single `version.dll`, `winmm.dll` or `winhttp.dll` is created while originals remain intact |
 
-```bash
-pnpm dev
-```
+Proxy mode requires an unambiguous API architecture. A game with both 32-bit and 64-bit top-level APIs must use direct mode.
+Launch options are read through SteamClient with a five-second timeout. The exact original and proposed replacement are journaled before any write.
+Automatic changes support only empty options, exactly `%command%`, or an unquoted simple path followed by ` %command%`.
+Other syntax is refused unless the owner selects manual launch-option management. In that case the plugin installs files, records the exact original and leaves Steam options untouched.
+Set the override and restore the original manually in Steam Properties. The plugin never merges an existing `WINEDLLOVERRIDES` assignment.
+If an automatic change cannot be confirmed, check Steam Properties. The game files may already be installed; **Remove / recover SmokeAPI** stays available.
 
-Ctrl+C restores the normal (non-symlinked) install and turns the restart-on-save behavior back off.
+## Removal and recovery
 
-## Acknowledgments
+Use **Remove / recover SmokeAPI** with the game closed. The backend restores originals only when recorded installed and backup hashes match.
+After an update it preserves changed DLLs and reports: `game changed since install, run Verify integrity in Steam`.
+Only matching recorded config, proxy and staging files are removed. Unknown files are preserved. Mismatches retain the journal and block further installs.
+Original launch options are restored only while the current string exactly matches the plugin's proposed string. Later owner changes remain untouched.
+Removing the Decky plugin itself does not undo game changes. Remove the game installation first and retain settings until rollback is complete.
 
-- [CreamInstaller](https://github.com/FroggMaster/CreamInstaller) — the Windows tool this plugin ports, and the source of every unlocker DLL it vendors ([decky/resources/](resources))
-- [CheatDeck](https://github.com/SheffeyG/CheatDeck) — the per-game context-menu → dedicated page navigation pattern this plugin's UI is built on
-- [decky-steamgriddb](https://github.com/SteamGridDB/decky-steamgriddb) — the original library-context-menu-patching technique CheatDeck (and in turn this plugin) reuses
-- **CreamAPI** by deadmau5, and **SmokeAPI** / **Koaloader** / **ScreamAPI** / **Uplay R1 Unlocker** / **Uplay R2 Unlocker** by [acidicoala](https://github.com/acidicoala) — the actual DLC unlockers this plugin installs (SmokeAPI/Koaloader: Unlicense; Uplay R1/R2 Unlocker: 0BSD; acidicoala/ScreamAPI's repo is currently disabled by GitHub for a ToS violation, so its license can't be independently re-verified right now)
+## Manual rollback
+
+1. Close the game and disable CreamDeck Hardened in Decky. Keep the per-app record and independent backups for inspection.
+2. Read `<appid>.json` from the distinct settings directory supplied by `decky.DECKY_PLUGIN_SETTINGS_DIR`. Confirm its `game_dir` against the actual library location yourself.
+3. In Steam Properties restore the exact `original_launch_options`, unless you deliberately changed it afterward. Resolve any later edits manually.
+4. Compare the record's hashes with `sha256sum` of the named files. Remove only recorded created config/proxy/staging files that still match. Preserve unknown or modified files for inspection.
+5. For direct mode, restore a recorded backup only if the current DLL matches the recorded installed hash and the backup matches the original hash. After a game update, preserve the newer DLL and run Steam **Verify integrity** instead of restoring an older backup.
+6. Inspect the remaining `_o.dll` backups. Archive matching old backups outside the game only after Steam has supplied a clean current DLL. Resolve any unknown file manually.
+7. Check that the game directory contains no plugin-created leftovers. Archive the resolved settings record outside the `.json` record namespace before a fresh install. Never reset a malformed record merely to unblock installation.
+8. Re-enable Decky only after rollback is complete. A full Steam UI restart clears a menu patch left by older upstream versions.
+
+## Development and package verification
+
+| Command | Purpose |
+|---|---|
+| `python -m unittest discover -s tests -v` | Backend regressions without network or Decky runtime |
+| `node --test tests/frontend.test.cjs` | Launch-option and menu-patch regressions |
+| `pnpm exec tsc --noEmit` | Frontend typecheck |
+| `pnpm build` | Build `dist/index.js` |
+| `python scripts/package_release.py` | Build ZIP, verify members and write `out/SHA256SUMS` |
+
+Production filesystem operations require Linux `O_NOFOLLOW`, directory descriptors, directory fsync and `renameat2` with no replacement.
+They fail closed on unsupported hosts. Windows unit runs use an explicit test-only filesystem adapter; Linux runs use the production implementation.
+Confirm the device Python version, Decky's user-home/settings helpers and real SteamOS behavior before device testing.

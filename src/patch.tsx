@@ -1,7 +1,7 @@
 /**
  * Adapted from CheatDeck (https://github.com/SheffeyG/CheatDeck/blob/main/src/patch.tsx),
  * itself credited to decky-steamgriddb's contextMenuPatch.tsx. Same react-patching
- * technique, renamed for the "CreamDeck" menu item and its own route.
+ * technique, renamed for the "CreamDeck Hardened" menu item and its own route.
  */
 
 import {
@@ -17,7 +17,7 @@ import {
 } from "@decky/ui";
 import type { FC } from "react";
 
-const MENU_ITEM_KEY = "creamdeck";
+const MENU_ITEM_KEY = "creamdeck-hardened";
 
 // Always add before "Properties..."
 const spliceMenuItem = (children: any[], appid: number) => {
@@ -25,15 +25,15 @@ const spliceMenuItem = (children: any[], appid: number) => {
     findInReactTree(item, (x) => x?.onSelected?.toString().includes("AppProperties")),
   );
   children.splice(
-    propertiesMenuItemIdx,
+    propertiesMenuItemIdx < 0 ? children.length : propertiesMenuItemIdx,
     0,
     <MenuItem
       key={MENU_ITEM_KEY}
       onSelected={() => {
-        Navigation.Navigate(`/creamdeck/${appid}`);
+        Navigation.Navigate(`/creamdeck-hardened/${appid}`);
       }}
     >
-      CreamDeck
+      CreamDeck Hardened
     </MenuItem>,
   );
 };
@@ -71,11 +71,18 @@ const patchMenuItems = (menuItems: any[], appid: number) => {
 };
 
 /**
- * Patches the game library context menu to add a "CreamDeck" entry.
+ * Patches the game library context menu to add a "CreamDeck Hardened" entry.
  * @param LibraryContextMenu The game context menu.
  * @returns A patch object; call `.unpatch()` to remove it when the plugin dismounts.
  */
+let activePatch: { unpatch: () => void } | undefined;
 const contextMenuPatch = (LibraryContextMenu: any) => {
+  if (activePatch) return activePatch;
+  if (!LibraryContextMenu?.prototype) return undefined;
+  const nested: Patch[] = [];
+  const patchedPrototypes = new WeakSet<object>();
+  let currentAppId: number | undefined;
+  let disposed = false;
   const patches: {
     outer?: Patch;
     inner?: Patch;
@@ -86,60 +93,72 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
     },
   };
   patches.outer = afterPatch(LibraryContextMenu.prototype, "render", (_: Record<string, unknown>[], component: any) => {
+    try {
     let appid: number | undefined;
-    if (component._owner) {
+    if (component?._owner?.pendingProps?.overview) {
       appid = component._owner.pendingProps.overview.appid;
     } else {
-      const foundApp = findInTree(component.props.children, (x) => x?.app?.appid, { walkable: ["props", "children"] });
+      const foundApp = findInTree(component?.props?.children, (x) => x?.app?.appid, { walkable: ["props", "children"] });
       if (foundApp) {
         appid = foundApp.app.appid;
       }
     }
+    currentAppId = appid;
     if (appid === undefined) {
       return component;
     }
 
     if (!patches.inner) {
       patches.inner = afterPatch(component, "type", (_: any, ret: any) => {
-        // initial render
-        afterPatch(ret.type.prototype, "render", (_: any, ret2: any) => {
-          const menuItems = ret2.props.children[0]; // always the first child
-          if (!isOpeningAppContextMenu(menuItems)) return ret2;
+        try {
+        const prototype = ret?.type?.prototype;
+        if (!prototype || patchedPrototypes.has(prototype)) return ret;
+        patchedPrototypes.add(prototype);
+        nested.push(afterPatch(prototype, "render", (_: any, ret2: any) => {
+          const menuItems = ret2?.props?.children?.[0];
+          if (!Array.isArray(menuItems) || !isOpeningAppContextMenu(menuItems) || !currentAppId) return ret2;
           try {
             handleItemDupes(menuItems);
+            patchMenuItems(menuItems, currentAppId);
           } catch (error) {
             return ret2;
           }
-          patchMenuItems(menuItems, appid!);
           return ret2;
-        });
+        }));
 
         // when Steam decides to refresh the app overview
-        afterPatch(ret.type.prototype, "shouldComponentUpdate", ([nextProps]: any, shouldUpdate: any) => {
+        nested.push(afterPatch(prototype, "shouldComponentUpdate", ([nextProps]: any, shouldUpdate: any) => {
           try {
+            if (!Array.isArray(nextProps?.children) || !currentAppId) return shouldUpdate;
             handleItemDupes(nextProps.children);
+            if (shouldUpdate === true) patchMenuItems(nextProps.children, currentAppId);
           } catch (error) {
             // wrong context menu (probably)
             return shouldUpdate;
           }
 
-          if (shouldUpdate === true) {
-            patchMenuItems(nextProps.children, appid!);
-          }
 
           return shouldUpdate;
-        });
+        }));
         return ret;
+        } catch { return ret; }
       });
     } else {
-      spliceMenuItem(component.props.children, appid);
+      if (Array.isArray(component?.props?.children)) {
+        try { handleItemDupes(component.props.children); spliceMenuItem(component.props.children, appid); } catch { /* Steam layout changed. */ }
+      }
     }
     return component;
+    } catch { return component; }
   });
   patches.unpatch = () => {
-    patches.outer?.unpatch();
-    patches.inner?.unpatch();
+    if (disposed) return;
+    disposed = true;
+    for (const patch of nested.splice(0).reverse()) { try { patch.unpatch(); } catch { /* Continue removing all handles. */ } }
+    try { patches.inner?.unpatch(); } catch { /* Continue removing all handles. */ }
+    try { patches.outer?.unpatch(); } finally { activePatch = undefined; }
   };
+  activePatch = patches;
   return patches;
 };
 
@@ -148,10 +167,13 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
  * documented/stable public API for it, so this relies on locating the render
  * function by looking for known internal identifiers, same as CheatDeck/decky-steamgriddb).
  */
-export const LibraryContextMenu = fakeRenderComponent(
-  Object.values(findModuleByExport((e: Export) => e?.toString?.().includes("().LibraryContextMenu"))).find((sibling) =>
-    sibling?.toString().includes("navigator:"),
-  ) as FC,
-).type;
+export const LibraryContextMenu = (() => {
+  try {
+    const module = findModuleByExport((e: Export) => e?.toString?.().includes("().LibraryContextMenu"));
+    if (!module) return undefined;
+    const sibling = Object.values(module).find((x) => x?.toString().includes("navigator:"));
+    return sibling ? fakeRenderComponent(sibling as FC)?.type : undefined;
+  } catch { return undefined; }
+})();
 
 export default contextMenuPatch;

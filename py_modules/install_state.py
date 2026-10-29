@@ -1,85 +1,172 @@
-"""
-The plugin's own on-disk record of "what's installed and which DLC are enabled"
-per game — this JSON file is the source of truth main.py reads from, instead of
-re-parsing each unlocker's own config file format (SmokeAPI.config.json,
-cream_api.ini, ...) on every page load. It's written right after a successful
-install/uninstall.
-
-Since this is *our* record of what *we* did, it can drift from what's actually
-on disk — Steam's "verify game files" restoring the original DLL, someone
-editing files by hand, a previous CreamInstaller-style install this plugin
-never wrote the record for, etc. main.py cross-checks this against
-unlocker_detection's live disk read and surfaces a mismatch rather than
-silently trusting either side.
-"""
-from __future__ import annotations
-
+"""Schema-validated per-app journals, atomically replaced under the backend lock."""
 import json
+import functools
 import os
-from typing import Optional, TypedDict
+import re
+import threading
+from safe_fs import Directory, app_id, component
 
-import decky
-
-
-class InstallState(TypedDict):
-    installed: bool
-    unlocker: str
-    proxy: bool
-    proxy_dll: Optional[str]
-    enabled_dlc_ids: list[str]
-    koaloader_autoload: list[str]
-
-
-def _store_path() -> str:
-    return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "install_state.json")
+LOCK = threading.RLock()
+PROXIES = ("version", "winmm", "winhttp")
+APIS = ("steam_api.dll", "steam_api64.dll")
+CONFIG = "SmokeAPI.config.json"
+FIELDS = {"schema", "app_id", "game_dir", "mode", "proxy_name", "originals", "installed",
+          "created", "stages", "phase", "original_launch_options", "set_launch_options", "enabled_dlc_ids",
+          "quarantine", "launch_restore"}
 
 
-def _load() -> dict[str, InstallState]:
-    path = _store_path()
-    if not os.path.isfile(path):
-        return {}
+def locked(function):
+    @functools.wraps(function)
+    def call(*args, **kwargs):
+        with LOCK:
+            return function(*args, **kwargs)
+    return call
+
+
+def launch_options(original, proxy):
+    if proxy not in PROXIES or not isinstance(original, str) or len(original) > 8192:
+        raise ValueError("Invalid launch options or proxy")
+    if "WINEDLLOVERRIDES" in original or (original not in ("", "%command%") and not re.fullmatch(r"[A-Za-z0-9_./~-]+ %command%", original)):
+        raise ValueError("Complex launch options. Set the Wine override by hand before using proxy mode")
+    return f'WINEDLLOVERRIDES="{proxy}=n,b" {original or "%command%"}'
+
+
+def validate(record, value):
+    app_id(value)
+    if isinstance(record, dict) and set(record) == FIELDS - {"quarantine", "launch_restore"}:
+        record = {**record, "quarantine": {}, "launch_restore": (
+            "pending" if record["mode"] == "proxy" and record["phase"] in ("removing", "removed")
+            else "acknowledged")}
+    if not isinstance(record, dict) or set(record) != FIELDS:
+        raise ValueError("Malformed install record. Refusing mutation")
+    if (type(record["schema"]) is not int or record["schema"] != 1 or record["app_id"] != value
+            or record["mode"] not in ("direct", "proxy")
+            or record["proxy_name"] not in PROXIES
+            or record["phase"] not in ("installing", "installed", "removing", "removed")):
+        raise ValueError("Invalid install record")
+    path = record["game_dir"]
+    if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise ValueError("Invalid recorded game directory")
+    for key in ("originals", "installed"):
+        hashes = record[key]
+        if not isinstance(hashes, dict) or not hashes:
+            raise ValueError("Missing recorded hashes")
+        for name, sha in hashes.items():
+            component(name)
+            if not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{64}", sha):
+                raise ValueError("Invalid recorded hash")
+    if not set(record["originals"]).issubset(APIS):
+        raise ValueError("Invalid original DLL names")
+    expected = ({*record["originals"], CONFIG} if record["mode"] == "direct"
+                else {record["proxy_name"] + ".dll", CONFIG})
+    if set(record["installed"]) != expected:
+        raise ValueError("Invalid installed file names")
+    backups = {x.replace(".dll", "_o.dll") for x in record["originals"]}
+    if not isinstance(record["created"], list) or any(not isinstance(x, str) for x in record["created"]):
+        raise ValueError("Invalid created file list")
+    if len(set(record["created"])) != len(record["created"]):
+        raise ValueError("Duplicate created file names")
+    if set(record["created"]) != (backups | {CONFIG} if record["mode"] == "direct" else expected):
+        raise ValueError("Unexpected created file names")
+    if not isinstance(record["stages"], dict) or set(record["stages"]) != expected:
+        raise ValueError("Invalid staging journal")
+    if (any(not isinstance(x, str) or not re.fullmatch(r"\.cdh-[0-9a-f]{32}", x)
+            for x in record["stages"].values())
+            or len(set(record["stages"].values())) != len(expected)):
+        raise ValueError("Unsafe staging name")
+    original = record["original_launch_options"]
+    if not isinstance(original, str) or len(original) > 8192:
+        raise ValueError("Invalid original launch options")
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
+        desired = launch_options(original, record["proxy_name"]) if record["mode"] == "proxy" else None
+    except ValueError:
+        desired = None
+    if record["set_launch_options"] != desired:
+        raise ValueError("Invalid recorded launch change")
+    if not isinstance(record["enabled_dlc_ids"], list) or len(record["enabled_dlc_ids"]) > 1000:
+        raise ValueError("Invalid DLC list")
+    for dlc in record["enabled_dlc_ids"]:
+        app_id(dlc)
+    if record["launch_restore"] not in ("pending", "acknowledged", "manual"):
+        raise ValueError("Invalid launch restoration state")
+    allowed = set()
+    for name, sha in record["installed"].items():
+        stage = record["stages"][name]
+        allowed.update(((stage, name, sha), (stage, None, sha), (name, None, sha)))
+        if record["mode"] == "direct" and name in record["originals"]:
+            backup = name.replace(".dll", "_o.dll")
+            original = record["originals"][name]
+            allowed.update(((name, backup, original), (backup, name, original), (name, stage, sha)))
+    quarantine = record["quarantine"]
+    if (not isinstance(quarantine, dict) or len(quarantine) > 100
+            or (quarantine and record["phase"] == "removed")):
+        raise ValueError("Invalid quarantine journal")
+    for name, entry in quarantine.items():
+        if (not isinstance(name, str) or not re.fullmatch(r"\.cdh-q-[0-9a-f]{32}", name)
+                or not isinstance(entry, dict)
+                or set(entry) not in ({"source", "target", "expected", "warning"},
+                                     {"source", "target", "expected", "warning", "dev", "ino"})
+                or not all(isinstance(entry[k], str) for k in ("source", "expected"))
+                or (entry["target"] is not None and not isinstance(entry["target"], str))
+                or not isinstance(entry["warning"], str) or len(entry["warning"]) > 1024
+                or (entry["source"], entry["target"], entry["expected"]) not in allowed):
+            raise ValueError("Unsafe quarantine journal")
+        if "dev" in entry and any(type(entry[k]) is not int or entry[k] < 0 for k in ("dev", "ino")):
+            raise ValueError("Invalid quarantine directory identity")
+    return record
 
 
-def _save(data: dict[str, InstallState]) -> None:
-    os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
-    with open(_store_path(), "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+class Store:
+    def __init__(self, path):
+        if not isinstance(path, str) or not os.path.isabs(path):
+            raise ValueError("Settings directory must be absolute")
+        with Directory(os.path.dirname(path)) as parent:
+            parent.ensure_child_dir(os.path.basename(path))
+        self.path = path
 
+    @locked
+    def load(self, value):
+        value = app_id(value)
+        with Directory(self.path) as directory:
+            name = value + ".json"
+            if not directory.exists(name):
+                return None
+            return validate(json.loads(directory.read(name, 128 * 1024)), value)
 
-def get_state(app_id: str) -> Optional[InstallState]:
-    return _load().get(app_id)
+    @locked
+    def all(self):
+        with Directory(self.path) as directory:
+            names = directory.names()
+        result = []
+        for name in names:
+            if name.endswith(".json") and name != "allowlist.json":
+                result.append(self.load(app_id(name[:-5])))
+            elif name.startswith(".cdh-"):
+                raise ValueError("Interrupted settings write. Inspect settings before mutation")
+        return result
 
+    @locked
+    def save(self, record):
+        validate(record, record["app_id"])
+        with Directory(self.path) as directory:
+            directory.atomic_json(record["app_id"] + ".json", json.dumps(record, sort_keys=True).encode())
 
-def set_installed(
-    app_id: str,
-    unlocker: str,
-    enabled_dlc_ids: list[str],
-    proxy: bool = False,
-    proxy_dll: Optional[str] = None,
-    koaloader_autoload: Optional[list[str]] = None,
-) -> None:
-    data = _load()
-    data[app_id] = InstallState(
-        installed=True,
-        unlocker=unlocker,
-        proxy=proxy,
-        proxy_dll=proxy_dll,
-        enabled_dlc_ids=enabled_dlc_ids,
-        koaloader_autoload=koaloader_autoload or [],
-    )
-    _save(data)
+    @locked
+    def allowlist(self):
+        with Directory(self.path) as directory:
+            if not directory.exists("allowlist.json"):
+                return []
+            data = json.loads(directory.read("allowlist.json", 128 * 1024))
+        if not isinstance(data, list) or len(data) > 1000:
+            raise ValueError("Malformed owner allowlist")
+        return [app_id(x) for x in data]
 
-
-def mark_uninstalled(app_id: str) -> None:
-    """Flips installed to False but keeps the rest of the record (unlocker choice,
-    DLC selection) around, so re-opening Install after an Uninstall starts from
-    what was last configured instead of blank defaults."""
-    data = _load()
-    if app_id in data:
-        data[app_id]["installed"] = False
-        _save(data)
+    def allow(self, value, confirmed):
+        app_id(value)
+        if confirmed is not True:
+            raise ValueError("Confirm offline single-player with no anti-cheat")
+        with LOCK:
+            self.all()
+            values = sorted(set(self.allowlist()) | {value})
+            with Directory(self.path) as directory:
+                directory.atomic_json("allowlist.json", json.dumps(values).encode())

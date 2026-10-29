@@ -1,103 +1,129 @@
-"""
-Port of CreamInstaller/Platforms/Steam/SteamLibrary.cs, scoped to a single
-appid instead of enumerating the whole library (per the plugin's per-game
-navigation flow: the game is already chosen via the library context menu,
-so there is no need to scan every installed game up front).
-"""
+"""Read one Steam manifest using Decky's user home and confined library paths."""
 from __future__ import annotations
 
 import os
-from typing import Optional, TypedDict
-
+import re
+import decky
+from safe_fs import Directory, app_id, component
 from vdf_lite import get_child, parse
 
-DEFAULT_STEAM_ROOT_CANDIDATES = [
-    os.path.expanduser("~/.local/share/Steam"),
-    os.path.expanduser("~/.steam/steam"),
-    os.path.expanduser("~/.steam/root"),
-]
+BUSY_MESSAGE = "Close the game (and wait for Steam to finish updating it) first"
+# EAppState UpdateRunning, UpdateStarted, Reconfiguring, Validating,
+# AddingFiles, Preallocating, Downloading, Staging, Committing, UpdateStopping.
+UPDATE_RUNNING_FLAGS = 256 | 1024 | 0xFF0000
 
 
-class GameInfo(TypedDict):
-    app_id: str
-    name: str
-    branch: str
-    build_id: int
-    game_directory: str
+def assert_game_idle(game, proc_path="/proc", ignored_fds=()):
+    if game.get("updating"):
+        raise ValueError(BUSY_MESSAGE)
+    game_path = os.path.realpath(game["game_directory"])
+
+    def under_game(path):
+        path = path.removesuffix(" (deleted)")
+        if not os.path.isabs(path):
+            return False
+        try:
+            return os.path.commonpath([game_path, os.path.realpath(path)]) == game_path
+        except ValueError:
+            return False
+
+    try:
+        pids = os.listdir(proc_path)
+    except OSError as error:
+        raise ValueError(BUSY_MESSAGE + ": cannot inspect /proc") from error
+    for pid in pids:
+        if not pid.isascii() or not pid.isdecimal():
+            continue
+        folder = os.path.join(proc_path, pid)
+        try:
+            cwd = os.readlink(os.path.join(folder, "cwd"))
+        except OSError:
+            pass
+        else:
+            if under_game(cwd):
+                raise ValueError(BUSY_MESSAGE)
+        try:
+            with open(os.path.join(folder, "maps"), encoding="utf-8", errors="surrogateescape") as stream:
+                for line in stream:
+                    fields = line.split(None, 5)
+                    if len(fields) == 6:
+                        path = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[5].rstrip("\n"))
+                        if under_game(path):
+                            raise ValueError(BUSY_MESSAGE)
+        except OSError:
+            pass
+        try:
+            fds = os.listdir(os.path.join(folder, "fd"))
+        except OSError:
+            continue
+        for fd in fds:
+            if pid == str(os.getpid()) and fd in {str(x) for x in ignored_fds}:
+                continue
+            try:
+                path = os.readlink(os.path.join(folder, "fd", fd))
+            except OSError:
+                continue
+            if under_game(path):
+                raise ValueError(BUSY_MESSAGE)
 
 
-def _steam_root() -> Optional[str]:
-    for candidate in DEFAULT_STEAM_ROOT_CANDIDATES:
-        if os.path.isdir(candidate):
-            return candidate
-    return None
-
-
-def _library_folders() -> list[str]:
-    """Returns every steamapps folder (default + any additional Steam library, e.g. on an SD card)."""
-    root = _steam_root()
-    if root is None:
+def library_folders():
+    home = getattr(decky, "DECKY_USER_HOME", None)
+    if not home or not os.path.isabs(home):
+        raise ValueError("Decky user-home helper is unavailable")
+    # Steam's home aliases may themselves be symlinks. Resolve that trusted
+    # discovery alias once, then use descriptor walks for every library access.
+    steam = next((os.path.realpath(os.path.join(home, suffix)) for suffix in
+                  (".local/share/Steam", ".steam/steam", ".steam/root")
+                  if os.path.isdir(os.path.join(home, suffix))), None)
+    if not steam:
         return []
-
-    folders: list[str] = []
-    default_steamapps = os.path.join(root, "steamapps")
-    if os.path.isdir(default_steamapps):
-        folders.append(default_steamapps)
-
-    library_folders_vdf = os.path.join(default_steamapps, "libraryfolders.vdf")
-    if os.path.isfile(library_folders_vdf):
-        with open(library_folders_vdf, "r", encoding="utf-8", errors="ignore") as f:
-            data = parse(f.read())
-        root_obj = get_child(data, "libraryfolders")
-        if isinstance(root_obj, dict):
-            for key, entry in root_obj.items():
-                if not key.isdigit() or not isinstance(entry, dict):
+    folders = [os.path.join(steam, "steamapps")]
+    with Directory(folders[0]) as directory:
+        if directory.exists("libraryfolders.vdf"):
+            data = get_child(parse(directory.read("libraryfolders.vdf").decode("utf-8")), "libraryfolders")
+            if not isinstance(data, dict):
+                raise ValueError("Invalid Steam library list")
+            for key, entry in data.items():
+                if not key.isdecimal() or not isinstance(entry, dict):
                     continue
-                raw_path = get_child(entry, "path")
-                if not raw_path:
-                    continue
-                steamapps_path = os.path.join(raw_path, "steamapps")
-                if os.path.isdir(steamapps_path) and steamapps_path not in folders:
-                    folders.append(steamapps_path)
+                path = get_child(entry, "path")
+                if not isinstance(path, str) or not os.path.isabs(path) or not os.path.isdir(path):
+                    raise ValueError("Steam library must be absolute and existing")
+                folder = os.path.join(path, "steamapps")
+                with Directory(folder):
+                    pass
+                if folder not in folders:
+                    folders.append(folder)
     return folders
 
 
-def find_game(app_id: str) -> Optional[GameInfo]:
-    """Looks for appmanifest_<app_id>.acf across every known library folder."""
-    for library_dir in _library_folders():
-        manifest_path = os.path.join(library_dir, f"appmanifest_{app_id}.acf")
-        if not os.path.isfile(manifest_path):
-            continue
-        with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
-            data = parse(f.read())
-        app_state = get_child(data, "AppState")
-        if not isinstance(app_state, dict):
-            continue
+def confined_game(library, install_dir):
+    component(install_dir)
+    common = os.path.join(library, "common")
+    path = os.path.join(common, install_dir)
+    if os.path.commonpath([os.path.realpath(common), os.path.realpath(path)]) != os.path.realpath(common):
+        raise ValueError("Game directory escapes steamapps/common")
+    with Directory(path):
+        pass
+    return path
 
-        install_dir = get_child(app_state, "installdir")
-        name = get_child(app_state, "name")
-        build_id = get_child(app_state, "buildid")
-        if not install_dir or not name or not build_id:
-            continue
 
-        branch = get_child(app_state, "UserConfig", "BetaKey") or get_child(
-            app_state, "MountedConfig", "BetaKey"
-        ) or "public"
-
-        game_directory = os.path.join(library_dir, "common", install_dir)
-        if not os.path.isdir(game_directory):
-            continue
-
-        try:
-            build_id_int = int(build_id)
-        except ValueError:
-            build_id_int = 0
-
-        return GameInfo(
-            app_id=app_id,
-            name=name,
-            branch=branch,
-            build_id=build_id_int,
-            game_directory=game_directory,
-        )
-    return None
+def find_game(value):
+    value = app_id(value)
+    for library in library_folders():
+        with Directory(library) as directory:
+            name = f"appmanifest_{value}.acf"
+            if not directory.exists(name):
+                continue
+            data = get_child(parse(directory.read(name).decode("utf-8")), "AppState")
+        if not isinstance(data, dict) or get_child(data, "appid") != value:
+            raise ValueError("Manifest app ID mismatch")
+        flags = get_child(data, "StateFlags")
+        if flags is not None and (not isinstance(flags, str) or not re.fullmatch(r"[0-9]+", flags)):
+            raise ValueError("Invalid manifest StateFlags")
+        return {"app_id": value, "name": get_child(data, "name") or value,
+                "game_directory": confined_game(library, get_child(data, "installdir")),
+                "updating": bool(int(flags) & UPDATE_RUNNING_FLAGS) if flags is not None else False,
+                "update_state_checked": flags is not None}
+    raise ValueError("Installed Steam game not found")

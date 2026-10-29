@@ -1,13 +1,12 @@
 {
-  "name": "creamdeck",
+  "name": "creamdeck-hardened",
   "version": "1.0.2",
-  "description": "Decky Loader plugin porting CreamInstaller's Steam DLC unlocking to Steam Deck.",
+  "description": "CreamDeck Hardened: SmokeAPI only, unprivileged, one offline Proton game at a time.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
-    "dev": "bash scripts/dev.sh",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "python -m unittest discover -s tests -v"
   },
   "repository": {
     "type": "git",

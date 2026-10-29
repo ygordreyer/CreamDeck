@@ -1,7 +1,6 @@
 """
 Minimal recursive-descent parser for Valve's KeyValues (VDF) text format,
-just enough to read libraryfolders.vdf, appmanifest_*.acf and SteamCMD's
-app_info_print output. Not a general-purpose VDF library.
+just enough to read libraryfolders.vdf and appmanifest_*.acf.
 """
 from __future__ import annotations
 
@@ -27,7 +26,6 @@ def _read_string(text: str, i: int) -> tuple[str, int]:
     n = len(text)
     if i < n and text[i] == '"':
         i += 1
-        start = i
         buf = []
         while i < n and text[i] != '"':
             if text[i] == "\\" and i + 1 < n:
@@ -36,34 +34,41 @@ def _read_string(text: str, i: int) -> tuple[str, int]:
                 continue
             buf.append(text[i])
             i += 1
+        if i >= n:
+            raise ValueError("Unterminated VDF string")
         return "".join(buf), i + 1
-    # Unquoted token (rare in these files, but be lenient)
     start = i
     while i < n and text[i] not in ' \t\r\n{}"':
         i += 1
+    if i == start:
+        raise ValueError("Unexpected VDF delimiter")
     return text[start:i], i
 
 
 def parse(text: str) -> Dict[str, Any]:
-    """Parses a VDF document and returns {rootKey: {...}} (or {} on failure)."""
+    """Reject truncated, ambiguous or excessively nested manifest data."""
     i = 0
     n = len(text)
     result: Dict[str, Any] = {}
 
-    def parse_object(i: int) -> tuple[Dict[str, Any], int]:
+    def parse_object(i: int, depth=0) -> tuple[Dict[str, Any], int]:
+        if depth > 32:
+            raise ValueError("VDF nesting limit exceeded")
         obj: Dict[str, Any] = {}
         while True:
             i = _skip_whitespace_and_comments(text, i)
             if i >= n:
-                break
+                raise ValueError("Unterminated VDF object")
             if text[i] == "}":
                 return obj, i + 1
             key, i = _read_string(text, i)
+            if not key or any(key.casefold() == x.casefold() for x in obj):
+                raise ValueError("Empty or duplicate VDF key")
             i = _skip_whitespace_and_comments(text, i)
             if i >= n:
-                break
+                raise ValueError("Missing VDF value")
             if text[i] == "{":
-                value, i = parse_object(i + 1)
+                value, i = parse_object(i + 1, depth + 1)
             else:
                 value, i = _read_string(text, i)
             obj[key] = value
@@ -72,6 +77,8 @@ def parse(text: str) -> Dict[str, Any]:
     i = _skip_whitespace_and_comments(text, i)
     while i < n:
         key, i = _read_string(text, i)
+        if not key or any(key.casefold() == x.casefold() for x in result):
+            raise ValueError("Empty or duplicate VDF key")
         i = _skip_whitespace_and_comments(text, i)
         if i < n and text[i] == "{":
             value, i = parse_object(i + 1)

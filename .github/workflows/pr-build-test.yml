@@ -29,10 +29,13 @@ jobs:
           # generate one). Re-add it once one's committed.
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile=false
+        run: pnpm install --frozen-lockfile
 
       - name: Type-check
         run: pnpm exec tsc --noEmit
+
+      - name: Frontend regression tests
+        run: node --test tests/frontend.test.cjs
 
       - name: Build
         run: pnpm run build
