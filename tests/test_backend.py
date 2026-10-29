@@ -192,31 +192,38 @@ class BackendTests(unittest.TestCase):
     def test_failed_copy_mid_install_rolls_back_exactly(self):
         original = TestDirectory.write_new
         count = 0
+        failure_fired = False
+        rollback_writes = []
+        failure = OSError("simulated copy failure")
         def fail(directory, name, data):
-            nonlocal count
+            nonlocal count, failure_fired
             path = getattr(directory, "path", None)
             # Store writes occur in settings; fail the second game staging copy.
-            is_game = (path == self.game) if path is not None else (directory.fd == active_fd[0])
+            if path is not None:
+                is_game = path == self.game
+            else:
+                current = os.fstat(directory.fd)
+                game = os.stat(self.game)
+                is_game = (current.st_dev, current.st_ino) == (game.st_dev, game.st_ino)
             if is_game:
-                count += 1
-                if count == 2:
-                    raise OSError("simulated copy failure")
+                if failure_fired:
+                    rollback_writes.append((name, data))
+                else:
+                    count += 1
+                    if count == 2:
+                        failure_fired = True
+                        raise failure
             return original(directory, name, data)
-        active_fd = [None]
-        original_enter = TestDirectory.__enter__
-        def enter(directory):
-            if os.name != "nt" and hasattr(directory, "fd"):
-                # Game is the only directory opened during the anti-cheat scan
-                # with the original Windows DLL filenames present.
-                if "steam_api64.dll" in directory.names():
-                    active_fd[0] = directory.fd
-            return original_enter(directory)
-        with patch.object(TestDirectory, "write_new", fail), patch.object(TestDirectory, "__enter__", enter):
-            with self.assertRaises(OSError):
+        with patch.object(TestDirectory, "write_new", fail):
+            with self.assertRaises(OSError) as error:
                 self.install()
+        self.assertIs(failure, error.exception)
+        self.assertTrue(failure_fired)
         self.assertEqual(2, count)
         self.assertEqual(self.before, self.snapshot())
         self.assertEqual("removed", self.store.load("123")["phase"])
+        # No original DLL moved before this failure; rollback only removes stages.
+        self.assertEqual([], rollback_writes)
 
     def test_failed_commit_mid_install_rolls_back_exactly(self):
         original = TestDirectory.rename
