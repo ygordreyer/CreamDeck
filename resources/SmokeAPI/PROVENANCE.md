@@ -7,7 +7,10 @@ These bundled files are copied from upstream Qiming-Liu/CreamDeck commit `242a61
 | steam_api.dll | 145aadfffde5140991995d76dca8f2423e9d7f9dbb66bc21565cee59746f027b |
 | steam_api64.dll | 3891cd70b8e06cad474b9ea5b6d7c3d19b9948c41df2495e3cf02d2a256498ef |
 
-Matching these files to an official acidicoala SmokeAPI release is still pending.
-The pins identify the reviewed CreamDeck snapshot. They do not authenticate a SmokeAPI release or audit native code.
-No network verification was performed for this fork. Native DLL network behavior, credential access and configuration compatibility remain unverified.
+Both files are byte-identical to the official acidicoala/SmokeAPI release v4.1.3 (checked 2026-10-28):
+- Asset: https://github.com/acidicoala/SmokeAPI/releases/download/v4.1.3/SmokeAPI-v4.1.3.zip
+- Asset digest: sha256:8a443b5b4c434a4904b272ea4d93ad7e13e212626c0e49466176cb828c1d2a3b
+- steam_api.dll is the release's smoke_api32.dll; steam_api64.dll is its smoke_api64.dll.
+
+This establishes origin only. It does not audit the native code. Native DLL network behavior, credential access and configuration compatibility remain unverified.
 The Python installer verifies both hashes before copying either file.
