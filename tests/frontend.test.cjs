@@ -171,3 +171,15 @@ test("all patch handles are removed and repeated installation is guarded", () =>
   module.default(Library).unpatch();
   assert.equal(handles.length, 5);
 });
+
+test("app id parses from Steam's routed page path", () => {
+  const { appIdFromPath } = load("src/utils/route.ts");
+  // Game Mode serves every page under /routes (https://steamloopback.host/routes/...).
+  assert.equal(appIdFromPath("/routes/creamdeck-hardened/1145350"), "1145350");
+  assert.equal(appIdFromPath("/routes/creamdeck-hardened/1145350/"), "1145350");
+  assert.equal(appIdFromPath("/creamdeck-hardened/1145350"), "1145350");
+  for (const bad of ["/routes/creamdeck-hardened/0123", "/routes/creamdeck-hardened/12345678901", "/routes/creamdeck-hardened/12x",
+    "/routes/creamdeck-hardened/../1", "/x/routes/creamdeck-hardened/1", "/routes/creamdeck/1", "/routes/library/app/1145350"]) {
+    assert.equal(appIdFromPath(bad), "", bad);
+  }
+});

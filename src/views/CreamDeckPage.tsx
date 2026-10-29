@@ -1,10 +1,11 @@
 import { ButtonItem, Dropdown, Focusable, PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
 import { acknowledgeLaunchRestore, allowGame, checked, GamePage, getGamePage, installSmokeAPI, resolveLaunchByHand, uninstallSmokeAPI } from "../utils/backend";
+import { appIdFromPath } from "../utils/route";
 import { changeLaunchOptions, getAppLaunchOptions } from "../utils/wineDllOverride";
 
 export default function CreamDeckPage() {
-  const appId = window.location.pathname.match(/^\/creamdeck-hardened\/([1-9][0-9]{0,9})\/?$/)?.[1] || "";
+  const appId = appIdFromPath(window.location.pathname);
   const [page, setPage] = useState<GamePage>({ found: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
