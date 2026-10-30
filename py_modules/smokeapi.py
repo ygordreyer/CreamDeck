@@ -4,13 +4,14 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import posixpath
 import stat
 import uuid
 
 from safe_fs import Directory, app_id, digest
 from install_state import APIS, CONFIG, LOCK, PROXIES, launch_options
 from resource_files import verified_resources
-from steam_library import assert_game_idle
+from steam_library import assert_game_idle, relative_executable
 
 CHANGED = "game changed since install, run Verify integrity in Steam"
 SCAN_DEPTH = 16
@@ -34,7 +35,7 @@ def anti_cheat(directory):
     scan(directory, SCAN_DEPTH)
 
 
-def api_directory(root, depth=SCAN_DEPTH):
+def api_directory(root, depth=SCAN_DEPTH, launches=()):
     """Top level if it has a Steam API DLL, else the one nested folder that does (Unreal keeps it under Engine/Binaries/ThirdParty)."""
     found, variants, native, truncated = [], [], [], []
 
@@ -64,6 +65,15 @@ def api_directory(root, depth=SCAN_DEPTH):
             raise ValueError(f"No Steam API DLL within {depth} folders of the game folder. Deeper folders were not searched")
         raise ValueError("No supported Windows Steam API DLL found in the game folder")
     if len(found) > 1:
+        relative = [os.path.relpath(path, root).replace(os.sep, "/").casefold() for path in found]
+        if len(set(relative)) == len(relative):
+            # The provider stays lazy: ordinary single-folder installs never open appinfo.
+            executables = launches() if callable(launches) else launches
+            folders = {posixpath.dirname(path).casefold() for value in executables
+                       if (path := relative_executable(value)) is not None}
+            selected = [path for path, name in zip(found, relative) if name in folders]
+            if len(selected) == 1:
+                return selected[0]
         raise ValueError("Several Steam API DLL folders found. Refusing to pick one")
     return found[0]
 
@@ -87,9 +97,10 @@ def inside_game(game, record):
 
 
 class Installer:
-    def __init__(self, store, find_game):
+    def __init__(self, store, find_game, launch_executables=None):
         self.store = store
         self.find_game = find_game
+        self.launch_executables = launch_executables or (lambda value: ())
 
     def install(self, value, mode, proxy, enabled, original_launch, manual_launch=False):
         with LOCK:
@@ -119,7 +130,7 @@ class Installer:
             resources = verified_resources()
             with Directory(game["game_directory"]) as root:
                 anti_cheat(root)
-            path = api_directory(game["game_directory"])
+            path = api_directory(game["game_directory"], launches=lambda: self.launch_executables(value))
             if mode == "proxy" and path != game["game_directory"]:
                 raise ValueError("Proxy mode needs the Steam API DLL in the game's top folder. Use direct mode")
             with Directory(path) as directory:

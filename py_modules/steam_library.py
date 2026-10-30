@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import decky
+from appinfo import launch_entries
 from safe_fs import Directory, app_id, component
 from vdf_lite import get_child, parse
 
@@ -67,15 +68,19 @@ def assert_game_idle(game, proc_path="/proc", ignored_fds=()):
                 raise ValueError(BUSY_MESSAGE)
 
 
-def library_folders():
+def steam_root():
     home = getattr(decky, "DECKY_USER_HOME", None)
     if not home or not os.path.isabs(home):
         raise ValueError("Decky user-home helper is unavailable")
     # Steam's home aliases may themselves be symlinks. Resolve that trusted
     # discovery alias once, then use descriptor walks for every library access.
-    steam = next((os.path.realpath(os.path.join(home, suffix)) for suffix in
+    return next((os.path.realpath(os.path.join(home, suffix)) for suffix in
                   (".local/share/Steam", ".steam/steam", ".steam/root")
                   if os.path.isdir(os.path.join(home, suffix))), None)
+
+
+def library_folders():
+    steam = steam_root()
     if not steam:
         return []
     folders = [os.path.join(steam, "steamapps")]
@@ -133,3 +138,55 @@ def find_game(value):
                 "updating": updating,
                 "update_state_checked": flags is not None}
     raise ValueError("Installed Steam game not found")
+
+
+def relative_executable(value):
+    if not isinstance(value, str):
+        return None
+    value = value.replace("\\", "/").removeprefix("./")
+    if ":" in value or "\0" in value or any(x in ("", ".", "..") for x in value.split("/")):
+        return None
+    return value
+
+
+def launch_executables(value):
+    try:
+        value = app_id(value)
+        manifest = None
+        for library in library_folders():
+            with Directory(library) as directory:
+                name = f"appmanifest_{value}.acf"
+                if directory.exists(name):
+                    manifest = get_child(parse(directory.read(name).decode("utf-8")), "AppState")
+                    break
+        if not isinstance(manifest, dict) or get_child(manifest, "appid") != value:
+            return []
+        mounted = get_child(manifest, "MountedConfig", "BetaKey")
+        user = get_child(manifest, "UserConfig", "BetaKey")
+        if any(branch is not None and not isinstance(branch, str) for branch in (mounted, user)):
+            return []
+        branch = mounted or user or "public"
+        result = []
+        for entry in launch_entries(os.path.join(steam_root(), "appcache"), value):
+            config = get_child(entry, "config")
+            if config is not None and not isinstance(config, dict):
+                return []
+            systems = get_child(config, "oslist")
+            beta = get_child(config, "betakey")
+            arch = get_child(config, "osarch")
+            # Validate every selector before filtering, even on an inactive entry.
+            if any(selector is not None and not isinstance(selector, str) for selector in (systems, beta, arch)):
+                return []
+            if systems is not None:
+                if "windows" not in {x.strip().casefold() for x in systems.split(",")}:
+                    continue
+            if beta is not None and beta.casefold() != branch.casefold():
+                continue
+            if arch is not None and arch != "64":
+                continue
+            executable = relative_executable(get_child(entry, "executable"))
+            if executable is not None:
+                result.append(executable)
+        return result
+    except (ValueError, OSError, RuntimeError, TypeError):
+        return []

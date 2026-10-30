@@ -20,7 +20,8 @@ def require_user():
 
 def backend():
     require_user()
-    return Installer(Store(decky.DECKY_PLUGIN_SETTINGS_DIR), steam_library.find_game)
+    return Installer(Store(decky.DECKY_PLUGIN_SETTINGS_DIR), steam_library.find_game,
+                     steam_library.launch_executables)
 
 
 class Plugin:
