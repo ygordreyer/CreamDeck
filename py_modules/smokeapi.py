@@ -33,23 +33,33 @@ def anti_cheat(directory):
 
 def api_directory(root, depth=16):
     """Top level if it has a Steam API DLL, else the one nested folder that does (Unreal keeps it under Engine/Binaries/ThirdParty)."""
-    found = []
+    found, variants, native, truncated = [], [], [], []
 
-    def scan(folder, path, depth):
+    def scan(folder, path, left):
         entries = folder.entries()
         if any(name in APIS and stat.S_ISREG(info.st_mode) for name, info in entries):
             found.append(path)
-        if depth:
-            for name, info in entries:
-                if stat.S_ISDIR(info.st_mode):
-                    with folder.child(name) as child:
-                        scan(child, os.path.join(path, name), depth - 1)
+        variants.extend(name for name, _ in entries if name.casefold() in APIS and name not in APIS)
+        native.extend(name for name, _ in entries if name == "libsteam_api.so")
+        for name, info in entries:
+            if stat.S_ISDIR(info.st_mode):
+                if not left:
+                    truncated.append(name)
+                    continue
+                with folder.child(name) as child:
+                    scan(child, os.path.join(path, name), left - 1)
     with Directory(root) as directory:
         if any(directory.exists(name) for name in APIS):
             return root
         scan(directory, root, depth)
     if not found:
-        raise ValueError("No Windows Steam API DLL in the game folder. Use the Proton game build")
+        if variants:
+            raise ValueError(f"Steam API DLL with unexpected letter case: {variants[0]}. Not supported yet")
+        if native:
+            raise ValueError("This is the native Linux build. Use the Proton game build")
+        if truncated:
+            raise ValueError(f"No Steam API DLL within {depth} folders of the game folder. Deeper folders were not searched")
+        raise ValueError("No supported Windows Steam API DLL found in the game folder")
     if len(found) > 1:
         raise ValueError("Several Steam API DLL folders found. Refusing to pick one")
     return found[0]
@@ -100,11 +110,13 @@ class Installer:
                 directory.rename_preflight()
                 originals = {name: directory.hash(name) for name in APIS if directory.exists(name)}
                 if not originals:
-                    raise ValueError("No Windows Steam API DLL in the game folder. Use the Proton game build")
+                    raise ValueError("No supported Windows Steam API DLL found in the game folder")
+                # Wine resolves DLL names case-insensitively, so any letter-case alias is a collision.
+                present = {name.casefold(): name for name, _ in directory.entries()}
                 for name in (*[x.replace(".dll", "_o.dll") for x in APIS], CONFIG,
                              *(x + ".dll" for x in PROXIES), ".dlc_unlocker_proxy.json"):
-                    if directory.exists(name):
-                        raise ValueError(f"Foreign file already exists: {name}")
+                    if name.casefold() in present:
+                        raise ValueError(f"Foreign file already exists: {present[name.casefold()]}")
                 config = {"$version": 4, "logging": False, "log_steam_http": False,
                           "default_app_status": "original", "override_app_status": {},
                           "override_dlc_status": {x: "unlocked" for x in enabled},

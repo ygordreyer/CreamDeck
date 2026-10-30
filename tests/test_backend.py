@@ -781,6 +781,41 @@ class BackendTests(unittest.TestCase):
             self.install()
         self.assertEqual({"steam_api64.dll"}, {x.name for x in win64.iterdir()})
 
+    def test_reserved_names_refused_in_any_letter_case(self):
+        # Linux names are case-sensitive but Wine's DLL lookup is not, so WinMM.dll beside winmm.dll is ambiguous.
+        def exact_exists(directory, name):
+            return name in directory.names()
+        for name in ("WinMM.dll", "VERSION.DLL", "WinHttp.dll", "Steam_API64_o.dll", install_state.CONFIG.upper()):
+            with self.subTest(name=name), patch.object(TestDirectory, "exists", exact_exists):
+                file = self.game / name
+                file.write_bytes(b"foreign injector")
+                before = self.snapshot()
+                with self.assertRaisesRegex(ValueError, "Foreign file already exists"):
+                    self.install()
+                self.assertEqual(before, self.snapshot())
+                file.unlink()
+
+    def test_missing_api_refusal_names_the_cause(self):
+        for name in install_state.APIS:
+            (self.game / name).unlink()
+        nested = self.game / "Engine" / "Win64"
+        nested.mkdir(parents=True)
+        for message, name in (("No supported Windows Steam API DLL", None),
+                              ("native Linux build", "libsteam_api.so"),
+                              ("unexpected letter case: Steam_api64.dll", "Steam_api64.dll")):
+            with self.subTest(message=message):
+                if name:
+                    (nested / name).write_bytes(b"placeholder")
+                with self.assertRaisesRegex(ValueError, message):
+                    smokeapi.api_directory(str(self.game))
+                if name:
+                    (nested / name).unlink()
+        deep = self.game.joinpath(*(f"d{n:02d}" for n in range(1, 18)))
+        deep.mkdir(parents=True)
+        (deep / "steam_api64.dll").write_bytes(b"placeholder")
+        with self.assertRaisesRegex(ValueError, "within 16 folders"):
+            smokeapi.api_directory(str(self.game))
+
     def test_library_paths_must_be_absolute_existing(self):
         for path in ("relative", str(self.base / "missing")):
             (self.library / "libraryfolders.vdf").write_text('"libraryfolders" { "1" { "path" "' + path.replace("\\", "\\\\") + '" } }')
