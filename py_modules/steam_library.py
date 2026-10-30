@@ -68,7 +68,7 @@ def assert_game_idle(game, proc_path="/proc", ignored_fds=()):
                 raise ValueError(BUSY_MESSAGE)
 
 
-def steam_root():
+def steam_path():
     home = getattr(decky, "DECKY_USER_HOME", None)
     if not home or not os.path.isabs(home):
         raise ValueError("Decky user-home helper is unavailable")
@@ -80,7 +80,7 @@ def steam_root():
 
 
 def library_folders():
-    steam = steam_root()
+    steam = steam_path()
     if not steam:
         return []
     folders = [os.path.join(steam, "steamapps")]
@@ -172,7 +172,7 @@ def launch_executables(value):
         if re.search(r"[,\s;|]", branch):
             return []
         result = []
-        for entry in launch_entries(os.path.join(steam_root(), "appcache"), value):
+        for entry in launch_entries(os.path.join(steam_path(), "appcache"), value):
             config = get_child(entry, "config")
             if config is not None and not isinstance(config, dict):
                 return []
