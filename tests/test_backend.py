@@ -929,6 +929,25 @@ class MetadataTests(unittest.TestCase):
         with patch.object(metadata, "fetch", side_effect=[{"data": {"123": {"common": {"name": "Example"}}}}, {"123": {"data": {"dlc": [456]}}}]):
             self.assertEqual([{"id": "456", "name": "DLC 456"}], metadata.lookup("123"))
 
+    def test_tls_trusts_the_system_ca_bundle(self):
+        # Decky's frozen Python looks for CAs under /usr/lib/ssl, which SteamOS lacks.
+        from unittest.mock import Mock
+        context = Mock()
+        with patch.object(metadata.ssl, "create_default_context", return_value=context),                 patch.object(metadata.os.path, "isfile", side_effect=lambda path: path == metadata.CA_FILES[0]):
+            self.assertIs(context, metadata.tls_context())
+        context.load_verify_locations.assert_called_once_with(cafile=metadata.CA_FILES[0])
+
+    def test_dlc_names_come_from_steamcmd_and_fall_back_to_ids(self):
+        def fetch(url):
+            if url.endswith("/123"):
+                return {"data": {"123": {"extended": {"listofdlc": "456,789"}}}}
+            if url.endswith("/456"):
+                return {"data": {"456": {"common": {"name": " Swamps of Corsus "}}}}
+            raise OSError("offline")
+        with patch.object(metadata, "fetch", side_effect=fetch):
+            self.assertEqual([{"id": "456", "name": "Swamps of Corsus"}, {"id": "789", "name": "DLC 789"}],
+                             metadata.lookup("123"))
+
     def test_response_cap_and_timeout(self):
         class Response:
             def __enter__(self): return self
