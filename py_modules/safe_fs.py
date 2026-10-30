@@ -120,6 +120,16 @@ class Directory:
                 raise ValueError(f"File exceeds size limit: {name}")
             return data
 
+    def read_head(self, name, cap):
+        component(name)
+        if not isinstance(cap, int) or cap < 0:
+            raise ValueError("Invalid head read size")
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError(f"Not a regular file: {name}")
+            return stream.read(cap)
+
     def hash(self, name):
         return digest(self.read(name)) if self.exists(name) else None
 

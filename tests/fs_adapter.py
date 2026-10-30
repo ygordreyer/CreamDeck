@@ -61,6 +61,14 @@ class WindowsTestDirectory(Directory):
             raise ValueError("Size cap")
         return data
 
+    def read_head(self, name, cap):
+        if not isinstance(cap, int) or cap < 0:
+            raise ValueError("Invalid head read size")
+        if not self.exists(name):
+            raise FileNotFoundError(name)
+        with (self.path / name).open("rb") as stream:
+            return stream.read(cap)
+
     def hash(self, name):
         return digest(self.read(name)) if self.exists(name) else None
 

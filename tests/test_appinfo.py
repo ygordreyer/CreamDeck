@@ -246,10 +246,10 @@ class AppinfoTests(unittest.TestCase):
         self.assertEqual(["Bin64/Game.exe"], steam_library.launch_executables(APP_ID))
         self.assertEqual(str(self.game / "Bin64"), self.resolve())
 
-    def test_non_string_launch_selectors_fail_closed_even_on_inactive_entries(self):
+    def test_invalid_launch_selector_types_fail_closed_even_on_inactive_entries(self):
         self.folders("Release", "Ship")
         for field in ("BetaKey", "osarch", "oslist"):
-            for value in ({}, (2, 64)):
+            for value in ({}, (3, 64.0)) if field == "osarch" else ({}, (2, 64)):
                 for selectors in ({}, {"oslist": "linux"}, {"BetaKey": "other"}):
                     with self.subTest(field=field, value=value, selectors=selectors):
                         self.write_launches(launch("Ship/Hades2.exe"),

@@ -175,14 +175,16 @@ def launch_executables(value):
             beta = get_child(config, "betakey")
             arch = get_child(config, "osarch")
             # Validate every selector before filtering, even on an inactive entry.
-            if any(selector is not None and not isinstance(selector, str) for selector in (systems, beta, arch)):
+            if any(selector is not None and not isinstance(selector, str) for selector in (systems, beta)):
+                return []
+            if arch is not None and (isinstance(arch, bool) or not isinstance(arch, (str, int))):
                 return []
             if systems is not None:
                 if "windows" not in {x.strip().casefold() for x in systems.split(",")}:
                     continue
             if beta is not None and beta.casefold() != branch.casefold():
                 continue
-            if arch is not None and arch != "64":
+            if arch is not None and arch not in ("64", 64):
                 continue
             executable = relative_executable(get_child(entry, "executable"))
             if executable is not None:

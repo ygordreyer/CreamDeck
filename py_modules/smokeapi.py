@@ -7,6 +7,7 @@ import os
 import posixpath
 import stat
 import uuid
+from contextlib import ExitStack
 
 from safe_fs import Directory, app_id, digest
 from install_state import APIS, CONFIG, LOCK, PROXIES, launch_options
@@ -33,6 +34,46 @@ def anti_cheat(directory):
                 with folder.child(name) as child:
                     scan(child, depth - 1)
     scan(directory, SCAN_DEPTH)
+
+
+def unity_amd64_directory(root, found, relative, executables):
+    unique = {}
+    for path in executables:
+        unique.setdefault(path.casefold(), path)
+    if len(unique) != 1 or len(found) != 2:
+        return None
+    executable = next(iter(unique.values()))
+    folder, name = posixpath.split(executable)
+    if not name.casefold().endswith(".exe"):
+        return None
+    plugins = posixpath.join(folder, name[:-4] + "_Data", "Plugins")
+    expected = [posixpath.join(plugins, arch).casefold() for arch in ("x86", "x86_64")]
+    if set(relative) != set(expected):
+        return None
+    selected = found[relative.index(expected[1])]
+    try:
+        with ExitStack() as stack:
+            directory = stack.enter_context(Directory(root))
+            binary = directory
+            for part in folder.split("/") if folder else ():
+                binary = stack.enter_context(binary.child(part))
+            header = binary.read_head(name, 4096)
+            if len(header) < 0x40 or header[:2] != b"MZ":
+                return None
+            offset = int.from_bytes(header[0x3C:0x40], "little")
+            if offset + 6 > len(header) or header[offset:offset + 4] != b"PE\0\0":
+                return None
+            if int.from_bytes(header[offset + 4:offset + 6], "little") != 0x8664:
+                return None
+            target = directory
+            for part in os.path.relpath(selected, root).split(os.sep):
+                target = stack.enter_context(target.child(part))
+            if target.exists("steam_api64.dll"):
+                return selected
+    except (OSError, ValueError):
+        # Failed evidence checks preserve the ambiguous-folder refusal.
+        pass
+    return None
 
 
 def api_directory(root, depth=SCAN_DEPTH, launches=()):
@@ -69,11 +110,16 @@ def api_directory(root, depth=SCAN_DEPTH, launches=()):
         if len(set(relative)) == len(relative):
             # The provider stays lazy: ordinary single-folder installs never open appinfo.
             executables = launches() if callable(launches) else launches
-            folders = {posixpath.dirname(path).casefold() for value in executables
-                       if (path := relative_executable(value)) is not None}
+            executables = [path for value in executables
+                           if (path := relative_executable(value)) is not None]
+            folders = {posixpath.dirname(path).casefold() for path in executables}
             selected = [path for path, name in zip(found, relative) if name in folders]
             if len(selected) == 1:
                 return selected[0]
+            if not selected:
+                unity = unity_amd64_directory(root, found, relative, executables)
+                if unity is not None:
+                    return unity
         raise ValueError("Several Steam API DLL folders found. Refusing to pick one")
     return found[0]
 
