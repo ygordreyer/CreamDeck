@@ -31,7 +31,7 @@ def anti_cheat(directory):
     scan(directory, 1)
 
 
-def api_directory(root, depth=8):
+def api_directory(root, depth=16):
     """Top level if it has a Steam API DLL, else the one nested folder that does (Unreal keeps it under Engine/Binaries/ThirdParty)."""
     found = []
 

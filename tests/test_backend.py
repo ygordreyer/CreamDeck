@@ -760,6 +760,16 @@ class BackendTests(unittest.TestCase):
         self.assertEqual([], self.engine.uninstall("123")[1])
         self.assertEqual(before, {x.name: x.read_bytes() for x in folder.iterdir()})
 
+    def test_deep_plugin_steam_api_is_found(self):
+        # FleshMadeFear (UE5) ships it ten folders down, inside a marketplace plugin.
+        for name in install_state.APIS:
+            (self.game / name).unlink()
+        folder = self.game.joinpath("Engine", "Plugins", "Marketplace", "SteamCorePro_5.4", "Source", "ThirdParty",
+                                    "SteamLibrary", "redistributable_bin", "win64")
+        folder.mkdir(parents=True)
+        (folder / "steam_api64.dll").write_bytes(b"original deep DLL")
+        self.assertEqual(str(folder), smokeapi.api_directory(str(self.game)))
+
     def test_unreal_nested_steam_api_refuses_proxy_and_ambiguous_folders(self):
         win64, = self.unreal_layout("Win64")
         with self.assertRaisesRegex(ValueError, "Proxy mode"):
