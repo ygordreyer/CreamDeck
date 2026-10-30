@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import struct
 import sys
 import tempfile
@@ -12,6 +13,7 @@ sys.path.insert(0, str(BASE / "py_modules"))
 
 import appinfo
 import decky
+import safe_fs
 import smokeapi
 import steam_library
 from fs_adapter import TestDirectory
@@ -278,3 +280,14 @@ class UnityArchTests(unittest.TestCase):
                     directory.read_head(name, cap)
             with self.assertRaises(FileNotFoundError):
                 directory.read_head("missing.exe", 2)
+
+    @unittest.skipUnless(sys.platform == "linux", "Requires Linux dir_fd operations and /proc/self/fd")
+    def test_directory_reads_reject_without_leaking_fds(self):
+        with safe_fs.Directory(str(self.game)) as directory:
+            for method, args in (("read_head", ("Darkwood_Data", 2)),
+                                 ("read", ("Darkwood_Data",))):
+                with self.subTest(method=method):
+                    before = len(os.listdir("/proc/self/fd"))
+                    with self.assertRaisesRegex(ValueError, "^Not a regular file: Darkwood_Data$"):
+                        getattr(directory, method)(*args)
+                    self.assertEqual(before, len(os.listdir("/proc/self/fd")))

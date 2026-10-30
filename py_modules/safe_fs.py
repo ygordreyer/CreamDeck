@@ -61,8 +61,9 @@ class Directory:
                     continue
                 component(part)
                 new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
-                os.close(self.fd)
+                previous = self.fd
                 self.fd = new
+                os.close(previous)
         except BaseException:
             self.close()
             raise
@@ -112,23 +113,38 @@ class Directory:
     def read(self, name, cap=16 * 1024 * 1024):
         component(name)
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
-        with os.fdopen(fd, "rb") as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ValueError(f"Not a regular file: {name}")
-            data = stream.read(cap + 1)
+            data = bytearray()
+            while len(data) < cap + 1:
+                chunk = os.read(fd, min(64 * 1024, cap + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
             if len(data) > cap:
                 raise ValueError(f"File exceeds size limit: {name}")
-            return data
+            return bytes(data)
+        finally:
+            os.close(fd)
 
     def read_head(self, name, cap):
         component(name)
         if not isinstance(cap, int) or cap < 0:
             raise ValueError("Invalid head read size")
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
-        with os.fdopen(fd, "rb") as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ValueError(f"Not a regular file: {name}")
-            return stream.read(cap)
+            data = bytearray()
+            while len(data) < cap:
+                chunk = os.read(fd, min(64 * 1024, cap - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            return bytes(data)
+        finally:
+            os.close(fd)
 
     def hash(self, name):
         return digest(self.read(name)) if self.exists(name) else None
@@ -139,7 +155,12 @@ class Directory:
                      0o600, dir_fd=self.fd)
         # Preserve partial writes for journaled recovery. Probe cleanup owns
         # its exclusive directory and removes partial writes independently.
-        with os.fdopen(fd, "wb") as stream:
+        try:
+            stream = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
