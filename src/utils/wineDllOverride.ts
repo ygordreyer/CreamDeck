@@ -38,13 +38,7 @@ export function mergeWineDllOverride(original: string, proxy: string): string {
 export async function changeLaunchOptions(appId: number, record: InstallRecord, restore: boolean,
   acknowledge?: () => Promise<void>): Promise<string> {
   if (record.mode !== "proxy") {
-    if (restore) {
-      const current = await getAppLaunchOptions(appId);
-      if (current !== record.original_launch_options) {
-        return "Launch options changed; left untouched. Restore the original manually in Steam Properties";
-      }
-      await acknowledge?.();
-    }
+    if (restore) await acknowledge?.();
     return "";
   }
   if (record.set_launch_options === null) {

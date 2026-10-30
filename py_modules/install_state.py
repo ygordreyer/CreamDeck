@@ -12,7 +12,7 @@ APIS = ("steam_api.dll", "steam_api64.dll")
 CONFIG = "SmokeAPI.config.json"
 FIELDS = {"schema", "app_id", "game_dir", "mode", "proxy_name", "originals", "installed",
           "created", "stages", "phase", "original_launch_options", "set_launch_options", "enabled_dlc_ids",
-          "quarantine", "launch_restore"}
+          "quarantine", "launch_restore", "foreign_proxies"}
 
 
 def locked(function):
@@ -33,10 +33,13 @@ def launch_options(original, proxy):
 
 def validate(record, value):
     app_id(value)
-    if isinstance(record, dict) and set(record) == FIELDS - {"quarantine", "launch_restore"}:
+    if isinstance(record, dict) and set(record) in (FIELDS - {"quarantine", "launch_restore", "foreign_proxies"},
+                                                   FIELDS - {"quarantine", "launch_restore"}):
         record = {**record, "quarantine": {}, "launch_restore": (
             "pending" if record["mode"] == "proxy" and record["phase"] in ("removing", "removed")
             else "acknowledged")}
+    if isinstance(record, dict) and set(record) == FIELDS - {"foreign_proxies"}:
+        record = {**record, "foreign_proxies": {}}
     if not isinstance(record, dict) or set(record) != FIELDS:
         raise ValueError("Malformed install record. Refusing mutation")
     if (type(record["schema"]) is not int or record["schema"] != 1 or record["app_id"] != value
@@ -89,6 +92,16 @@ def validate(record, value):
         app_id(dlc)
     if record["launch_restore"] not in ("pending", "acknowledged", "manual"):
         raise ValueError("Invalid launch restoration state")
+    if record["mode"] == "direct" and record["launch_restore"] == "pending":
+        record = {**record, "launch_restore": "acknowledged"}
+    foreign = record["foreign_proxies"]
+    if not isinstance(foreign, dict) or (foreign and record["mode"] != "direct"):
+        raise ValueError("Invalid foreign proxy journal")
+    for name, sha in foreign.items():
+        component(name)
+        if (name.casefold() not in {x + ".dll" for x in PROXIES}
+                or not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{64}", sha)):
+            raise ValueError("Invalid foreign proxy hash or name")
     allowed = set()
     for name, sha in record["installed"].items():
         stage = record["stages"][name]
@@ -147,7 +160,7 @@ class Store:
 
     @locked
     def save(self, record):
-        validate(record, record["app_id"])
+        record = validate(record, record["app_id"])
         with Directory(self.path) as directory:
             directory.atomic_json(record["app_id"] + ".json", json.dumps(record, sort_keys=True).encode())
 

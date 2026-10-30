@@ -30,6 +30,7 @@ function CreamDeckPage({ appId }: { appId: string }) {
     if (mounted.current) {
       setPage(result);
       setEnabled(result.record?.enabled_dlc_ids || []);
+      setProxy((old) => result.available_proxies?.includes(old) ? old : result.available_proxies?.[0] || "");
     }
   }
   async function acknowledgeRestore() {
@@ -100,14 +101,15 @@ function CreamDeckPage({ appId }: { appId: string }) {
     <PanelSection title="SmokeAPI">
       <p>Close the game first. One recorded game at a time. DLC files must already be installed.</p>
       <PanelSectionRow><Dropdown selectedOption={mode} rgOptions={[{ label: "Direct", data: "direct" }, { label: "Proxy", data: "proxy" }]} onChange={(x) => setMode(x.data)} /></PanelSectionRow>
-      {mode === "proxy" && <PanelSectionRow><Dropdown selectedOption={proxy} rgOptions={["version", "winmm", "winhttp"].map((x) => ({ label: x, data: x }))} onChange={(x) => setProxy(x.data)} /></PanelSectionRow>}
+      {mode === "proxy" && <PanelSectionRow><Dropdown selectedOption={proxy} rgOptions={(page.available_proxies || []).map((x) => ({ label: x, data: x }))} onChange={(x) => setProxy(x.data)} /></PanelSectionRow>}
+      {mode === "proxy" && !page.available_proxies?.length && <p>No free supported proxy name in the game's top folder. Use direct mode.</p>}
       <p>Proxy mode supports empty options, %command%, or a simple path followed by %command%. Other syntax requires manual setup.</p>
       {mode === "proxy" && <PanelSectionRow><ToggleField label="For complex options, I will set the Wine override and restore the original manually" checked={manualLaunch} onChange={setManualLaunch} /></PanelSectionRow>}
       {(page.dlcs || []).map((dlc) => <PanelSectionRow key={dlc.id}><ToggleField label={dlc.name} checked={enabled.includes(dlc.id)} onChange={(on) => setEnabled((old) => on ? [...old, dlc.id] : old.filter((x) => x !== dlc.id))} /></PanelSectionRow>)}
       {!page.dlcs?.length && <p>No DLC metadata found. Installing with zero selected DLC is allowed.</p>}
-      <PanelSectionRow><ButtonItem disabled={busy || !page.allowed || !page.found || page.record?.launch_restore === "pending" || (!!page.record && page.record.phase !== "removed")} onClick={() => void run(async () => {
+      <PanelSectionRow><ButtonItem disabled={busy || !page.allowed || !page.found || (mode === "proxy" && !page.available_proxies?.includes(proxy)) || page.record?.launch_restore === "pending" || (!!page.record && page.record.phase !== "removed")} onClick={() => void run(async () => {
         const original = await getAppLaunchOptions(Number(appId));
-        const result = checked(await installSmokeAPI(appId, mode, proxy, enabled, original, manualLaunch));
+        const result = checked(await installSmokeAPI(appId, mode, mode === "direct" ? "version" : proxy, enabled, original, manualLaunch));
         if (result.record) {
           setPage((old) => ({ ...old, record: result.record }));
           setMessage(await changeLaunchOptions(Number(appId), result.record, false) || "SmokeAPI installed");

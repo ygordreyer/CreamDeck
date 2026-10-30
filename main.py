@@ -10,7 +10,7 @@ import decky
 import metadata
 import steam_library
 from install_state import LOCK, Store
-from smokeapi import Installer
+from smokeapi import Installer, available_proxies
 
 
 def require_user():
@@ -31,7 +31,8 @@ class Plugin:
                 game = steam_library.find_game(app_id)
                 status, record = instance.status(app_id)
                 return {"found": True, "name": game["name"], "status": status,
-                        "allowed": app_id in instance.store.allowlist(), "record": record}
+                        "allowed": app_id in instance.store.allowlist(), "record": record,
+                        "available_proxies": available_proxies(game["game_directory"])}
         try:
             result = await asyncio.to_thread(read)
             result["dlcs"] = await metadata.dlcs(app_id)

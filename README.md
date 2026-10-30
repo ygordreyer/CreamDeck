@@ -14,15 +14,15 @@ CreamInstaller by FroggMaster supplied the upstream install approach. SmokeAPI i
 | Decky user permissions | Root flag and privileged development script to contain filesystem access |
 | Per-app settings journals | Game-local proxy state and config-based detection to prevent unsafe cleanup |
 
-No device installation or game launch has been performed for this fork.
-The DLL pins match the upstream CreamDeck snapshot. Matching an official SmokeAPI release is still pending; see `resources/SmokeAPI/PROVENANCE.md`.
+SmokeAPI has been installed and removed once in Sleeping Dogs. Gameplay and DLC unlocking have not been verified.
+The DLL pins match the upstream CreamDeck snapshot and the official SmokeAPI v4.1.3 release; see `resources/SmokeAPI/PROVENANCE.md`.
 The opaque DLLs' network behavior, configuration compatibility and credential access are unverified.
 
 ## Owner allowlist
 
 The allowlist starts empty. The owner must confirm that the current game is offline single-player with no anti-cheat, then choose **Add this game to owner allowlist**.
 Never add an online game, including one that offers an offline mode. A marker scan cannot establish that a game is safe.
-The backend independently requires this allowlist and rejects EAC/BattlEye markers in the first two directory levels, ignoring case.
+The backend independently requires this allowlist and rejects EAC/BattlEye markers down to 16 folders deep, ignoring case. It refuses if deeper folders prevent a complete scan.
 Only one active or unresolved install record is permitted across all games. Remove or manually recover that installation before installing another.
 
 ## Install the reviewed ZIP
@@ -46,10 +46,11 @@ flowchart LR
 
 | Mode | Behavior |
 |---|---|
-| Direct | Original top-level Steam API DLLs are renamed to `_o.dll` backups before installing replacements |
-| Proxy | A single `version.dll`, `winmm.dll` or `winhttp.dll` is created while originals remain intact |
+| Direct | Original Steam API DLLs in the top folder or one unambiguous nested API folder are renamed to `_o.dll` backups before installing replacements |
+| Proxy | A free `version.dll`, `winmm.dll` or `winhttp.dll` is created in the top folder while originals remain intact |
 
 Proxy mode requires an unambiguous API architecture. A game with both 32-bit and 64-bit top-level APIs must use direct mode.
+Direct mode preserves existing proxy DLLs and warns on removal if their recorded hashes changed. It never changes launch options or requires their restoration.
 Launch options are read through SteamClient with a five-second timeout. The exact original and proposed replacement are journaled before any write.
 Automatic changes support only empty options, exactly `%command%`, or an unquoted simple path followed by ` %command%`.
 Other syntax is refused unless the owner selects manual launch-option management. In that case the plugin installs files, records the exact original and leaves Steam options untouched.

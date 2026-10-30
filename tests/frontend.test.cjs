@@ -123,15 +123,59 @@ test("failed acknowledgment remains a failed recovery and can be retried", async
   assert.equal(acknowledged, true);
 });
 
-test("direct-mode recovery also observes the saved original before acknowledgment", async () => {
+test("direct-mode recovery always acknowledges without reading or writing Steam options", async () => {
   for (const current of ["", "owner edit"]) {
     let acknowledgments = 0;
     const { changeLaunchOptions } = wine({ SteamClient: { Apps: {
-      RegisterForAppDetails(_id, callback) { callback({ strLaunchOptions: current }); return { unregister() {} }; },
+      RegisterForAppDetails() { assert.fail("direct mode does not owe restoration, even after an owner edit"); },
       SetAppLaunchOptions() { assert.fail("direct mode never changed launch options"); },
     } } });
-    await changeLaunchOptions(123, { ...record, mode: "direct", set_launch_options: null }, true, async () => { acknowledgments++; });
-    assert.equal(acknowledgments, current === "" ? 1 : 0);
+    const direct = { ...record, mode: "direct", set_launch_options: null, original_launch_options: current };
+    assert.equal(await changeLaunchOptions(123, direct, false), "");
+    assert.equal(acknowledgments, 0);
+    assert.equal(await changeLaunchOptions(123, direct, true, async () => { acknowledgments++; }), "");
+    assert.equal(acknowledgments, 1);
+  }
+});
+
+test("the page offers only free backend proxy names and disables an unavailable selection", () => {
+  for (const available of [["version", "winhttp"], []]) {
+    let hook = 0;
+    const backend = {};
+    const ui = Object.fromEntries(["ButtonItem", "Dropdown", "Focusable", "PanelSection", "PanelSectionRow", "ToggleField"].map((name) => [name, name]));
+    const module = load("src/views/CreamDeckPage.tsx", { window: { location: { pathname: "/creamdeck-hardened/123" } }, require(id) {
+      if (id === "@decky/ui") return ui;
+      if (id === "react") return {
+        useEffect() {}, useRef(value) { return { current: value }; },
+        useState(initial) {
+          const index = hook++;
+          const value = index === 0 ? { found: true, allowed: true, available_proxies: available }
+            : index === 5 ? "proxy" : initial;
+          return [value, () => {}];
+        },
+      };
+      if (id === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
+      if (id === "../utils/backend") return backend;
+      if (id === "../utils/route") return { pageAppId: () => "123" };
+      if (id === "../utils/wineDllOverride") return {};
+      throw Error(id);
+    } });
+    const route = module.default();
+    const tree = route.type(route.props);
+    const nodes = [];
+    function walk(node) {
+      if (Array.isArray(node)) return node.forEach(walk);
+      if (!node || typeof node !== "object") return;
+      nodes.push(node);
+      walk(node.props?.children);
+    }
+    walk(tree);
+    const choices = nodes.find((node) => node.type === "Dropdown" && node.props.selectedOption === "version");
+    assert.ok(choices, "proxy dropdown rendered");
+    assert.deepEqual(Array.from(choices.props.rgOptions, (option) => option.data), available);
+    assert.equal(choices.props.rgOptions.some((option) => option.data === "winmm"), false);
+    const install = nodes.find((node) => node.type === "ButtonItem" && node.props.children === "Install SmokeAPI");
+    assert.equal(install.props.disabled, available.length === 0);
   }
 });
 

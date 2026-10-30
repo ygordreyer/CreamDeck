@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import asyncio
+from contextlib import ExitStack
 import copy
 import errno
 import json
 import os
+import stat
 from pathlib import Path
 import sys
 import tempfile
@@ -73,6 +76,14 @@ class BackendTests(unittest.TestCase):
 
     def snapshot(self):
         return {x.name: x.read_bytes() for x in self.game.iterdir() if x.is_file() and not x.is_symlink()}
+
+    def tree_snapshot(self):
+        result = {}
+        for path in self.game.rglob("*"):
+            info = path.lstat()
+            data = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
+            result[path.relative_to(self.game).as_posix()] = (info.st_mode, info.st_dev, info.st_ino, data)
+        return result
 
     def install(self, mode="direct", original=""):
         return self.engine.install("123", mode, "version", [], original)
@@ -157,6 +168,38 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(b"original 64-bit DLL", (self.game / "steam_api64.dll").read_bytes())
         self.assertEqual([], self.engine.uninstall("123")[1])
         self.assertEqual(before, self.snapshot())
+
+    def test_direct_removal_after_external_launch_edit_needs_no_restore(self):
+        first = self.install(original="original %command%")
+        self.assertIsNone(first["set_launch_options"])
+        external = "luma-wrapper %command%"
+        record, warnings = self.engine.uninstall("123")
+        self.assertEqual([], warnings)
+        self.assertEqual("acknowledged", record["launch_restore"])
+        self.assertEqual("acknowledged", self.store.load("123")["launch_restore"])
+        second = self.install(original=external)
+        self.assertIsNone(second["set_launch_options"])
+        self.assertEqual(external, second["original_launch_options"])
+
+    def test_old_direct_pending_record_does_not_block_reinstall(self):
+        record = self.install()
+        self.engine.uninstall("123")
+        record.update(phase="removed", launch_restore="pending")
+        record.pop("foreign_proxies")
+        (self.settings / "123.json").write_text(json.dumps(record))
+        self.assertEqual({}, self.store.load("123")["foreign_proxies"])
+        self.assertEqual("acknowledged", self.store.load("123")["launch_restore"])
+        self.install(original="luma-wrapper %command%")
+
+    def test_old_proxy_pending_record_still_requires_restore(self):
+        (self.game / "steam_api.dll").unlink()
+        self.install("proxy")
+        record, _ = self.engine.uninstall("123")
+        record.pop("foreign_proxies")
+        (self.settings / "123.json").write_text(json.dumps(record))
+        self.assertEqual("pending", self.store.load("123")["launch_restore"])
+        with self.assertRaisesRegex(ValueError, "restoration is pending"):
+            self.install()
 
     def test_post_update_uninstall_keeps_new_dll_and_backup(self):
         self.install()
@@ -269,6 +312,55 @@ class BackendTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "Anti-cheat"):
                         self.install()
                     file.unlink()
+
+    def test_nested_anticheat_markers_refuse_without_mutation(self):
+        for depth in (3, 16):
+            folder = self.game.joinpath(*(f"d{n}" for n in range(depth)))
+            folder.mkdir(parents=True, exist_ok=True)
+            for name in ("EasyAntiCheat_x64.dll", "eAsYaNtIcHeAt_X64.DlL", "bEsErViCe_test.ExE"):
+                with self.subTest(depth=depth, name=name):
+                    file = folder / name
+                    file.write_bytes(b"marker")
+                    before = self.tree_snapshot()
+                    with patch.object(self.store, "save") as save, patch.object(TestDirectory, "rename_preflight") as probe:
+                        with self.assertRaisesRegex(ValueError, "Anti-cheat marker"):
+                            self.install()
+                        save.assert_not_called()
+                        probe.assert_not_called()
+                    self.assertEqual(before, self.tree_snapshot())
+                    file.unlink()
+
+    def test_anticheat_truncated_scan_refuses_without_mutation(self):
+        folder = self.game.joinpath(*(f"d{n}" for n in range(17)))
+        folder.mkdir(parents=True)
+        (folder / "hidden.txt").write_bytes(b"unscanned")
+        before = self.tree_snapshot()
+        with patch.object(self.store, "save") as save, patch.object(TestDirectory, "rename_preflight") as probe:
+            with self.assertRaisesRegex(ValueError, "Anti-cheat scan incomplete.*16-folder limit"):
+                self.install()
+            save.assert_not_called()
+            probe.assert_not_called()
+        self.assertEqual(before, self.tree_snapshot())
+
+    def test_nested_scan_symlink_and_traversal_failure_refuse_without_mutation(self):
+        folder = self.game / "a" / "b" / "c"
+        folder.mkdir(parents=True)
+        link = folder / "alias"
+        link.symlink_to(self.base, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "Symlink"):
+            self.install()
+        link.unlink()
+        before = self.tree_snapshot()
+        entries = TestDirectory.entries
+        def denied(directory):
+            if "c" in directory.names():
+                raise PermissionError("scan denied")
+            return entries(directory)
+        with patch.object(TestDirectory, "entries", denied), patch.object(self.store, "save") as save:
+            with self.assertRaisesRegex(PermissionError, "scan denied"):
+                self.install()
+            save.assert_not_called()
+        self.assertEqual(before, self.tree_snapshot())
 
     def test_malformed_state_and_allowlist_refuse_mutation(self):
         for data in ("{", "{}", "[]", '{"schema": 1}'):
@@ -659,6 +751,47 @@ class BackendTests(unittest.TestCase):
             self.engine.uninstall("123")
         self.assertEqual(installed, self.snapshot())
 
+    def test_not_fully_installed_manifest_refuses_with_or_without_folder(self):
+        for folder in ("Example", "Missing"):
+            with self.subTest(folder=folder):
+                self.manifest(folder)
+                manifest = self.library / "appmanifest_123.acf"
+                manifest.write_text(manifest.read_text().replace('"AppState" {', '"AppState" { "StateFlags" "1"'))
+                with self.assertRaisesRegex(ValueError, "not installed"):
+                    steam_library.find_game("123")
+                with self.assertRaisesRegex(ValueError, "not installed"):
+                    self.install()
+                self.assertEqual(self.before, self.snapshot())
+
+    def test_fully_installed_manifest_with_missing_folder_refuses_clearly(self):
+        self.manifest("Missing")
+        manifest = self.library / "appmanifest_123.acf"
+        manifest.write_text(manifest.read_text().replace('"AppState" {', '"AppState" { "StateFlags" "4"'))
+        with self.assertRaisesRegex(ValueError, "not installed.*folder is missing"):
+            steam_library.find_game("123")
+
+    def test_updating_manifest_without_fully_installed_bit_keeps_busy_behavior(self):
+        manifest = self.library / "appmanifest_123.acf"
+        manifest.write_text(manifest.read_text().replace('"AppState" {', '"AppState" { "StateFlags" "1048576"'))
+        self.assertTrue(steam_library.find_game("123")["updating"])
+        with self.assertRaisesRegex(ValueError, "Close the game"):
+            self.install()
+        self.assertEqual(self.before, self.snapshot())
+
+    def test_manifest_without_stateflags_keeps_legacy_behavior(self):
+        game = steam_library.find_game("123")
+        self.assertFalse(game["updating"])
+        self.assertFalse(game["update_state_checked"])
+        self.install()
+        self.assertEqual([], self.engine.uninstall("123")[1])
+        self.assertEqual(self.before, self.snapshot())
+
+    def test_orphan_game_folder_is_not_an_installed_game(self):
+        (self.library / "appmanifest_123.acf").unlink()
+        with self.assertRaisesRegex(ValueError, "Installed Steam game not found"):
+            steam_library.find_game("123")
+        self.assertEqual(self.before, self.snapshot())
+
     def test_new_writer_after_staging_defers_rollback_until_game_is_closed(self):
         pid = self.proc / "12345"
         pid.mkdir()
@@ -782,18 +915,141 @@ class BackendTests(unittest.TestCase):
         self.assertEqual({"steam_api64.dll"}, {x.name for x in win64.iterdir()})
 
     def test_reserved_names_refused_in_any_letter_case(self):
-        # Linux names are case-sensitive but Wine's DLL lookup is not, so WinMM.dll beside winmm.dll is ambiguous.
         def exact_exists(directory, name):
             return name in directory.names()
-        for name in ("WinMM.dll", "VERSION.DLL", "WinHttp.dll", "Steam_API64_o.dll", install_state.CONFIG.upper()):
-            with self.subTest(name=name), patch.object(TestDirectory, "exists", exact_exists):
-                file = self.game / name
-                file.write_bytes(b"foreign injector")
-                before = self.snapshot()
-                with self.assertRaisesRegex(ValueError, "Foreign file already exists"):
-                    self.install()
-                self.assertEqual(before, self.snapshot())
-                file.unlink()
+        for mode in ("direct", "proxy"):
+            for name in ("Steam_API_o.dll", "Steam_API64_o.dll", install_state.CONFIG.upper(), ".DLC_UNLOCKER_PROXY.JSON"):
+                with self.subTest(mode=mode, name=name), patch.object(TestDirectory, "exists", exact_exists):
+                    file = self.game / name
+                    file.write_bytes(b"foreign injector")
+                    before = self.tree_snapshot()
+                    with self.assertRaisesRegex(ValueError, "Foreign file already exists"):
+                        self.install(mode)
+                    self.assertEqual(before, self.tree_snapshot())
+                    file.unlink()
+
+    def test_proxy_occupied_name_refused_in_any_letter_case(self):
+        (self.game / "steam_api.dll").unlink()
+        for proxy in install_state.PROXIES:
+            for name in (proxy + ".dll", proxy.upper() + ".DLL", proxy.capitalize() + ".dll"):
+                with self.subTest(proxy=proxy, name=name), patch.object(TestDirectory, "exists", lambda directory, name: name in directory.names()):
+                    file = self.game / name
+                    file.write_bytes(b"foreign injector")
+                    before = self.tree_snapshot()
+                    with self.assertRaisesRegex(ValueError, "Foreign file already exists"):
+                        self.engine.install("123", "proxy", proxy, [], "")
+                    self.assertEqual(before, self.tree_snapshot())
+                    file.unlink()
+
+    def test_direct_foreign_proxy_bytes_and_inode_preserved(self):
+        file = self.game / "WinMM.dll"
+        file.write_bytes(b"owner OptiScaler")
+        before = self.tree_snapshot()
+        record = self.install()
+        self.assertEqual({"WinMM.dll": safe_fs.digest(b"owner OptiScaler")}, record["foreign_proxies"])
+        self.assertNotIn("WinMM.dll", record["created"])
+        self.assertNotIn("WinMM.dll", record["stages"])
+        self.assertEqual(before["WinMM.dll"], self.tree_snapshot()["WinMM.dll"])
+        self.assertEqual([], self.engine.uninstall("123")[1])
+        self.assertEqual(before, self.tree_snapshot())
+
+    def test_direct_changed_foreign_proxy_warns_and_preserves_identity(self):
+        file = self.game / "WinMM.dll"
+        file.write_bytes(b"owner OptiScaler")
+        self.install()
+        file.write_bytes(b"owner OptiScaler update")
+        changed = self.tree_snapshot()["WinMM.dll"]
+        record, warnings = self.engine.uninstall("123")
+        self.assertTrue(any("Foreign proxy changed" in warning and "WinMM.dll" in warning for warning in warnings))
+        self.assertEqual(changed, self.tree_snapshot()["WinMM.dll"])
+        self.assertEqual("acknowledged", record["launch_restore"])
+
+    def test_foreign_proxy_schema_rejects_unsafe_names_and_hashes(self):
+        record = self.install()
+        for foreign in ({"../winmm.dll": "0" * 64}, {"dxgi.dll": "0" * 64}, {"winmm.dll": "bad"}, []):
+            with self.subTest(foreign=foreign):
+                altered = {**record, "foreign_proxies": foreign}
+                with self.assertRaises(ValueError):
+                    install_state.validate(altered, "123")
+
+    def test_available_proxies_omit_case_aliases_and_allow_other_names(self):
+        (self.game / "steam_api.dll").unlink()
+        (self.game / "WinMM.dll").write_bytes(b"owner OptiScaler")
+        self.assertEqual(["version", "winhttp"], smokeapi.available_proxies(str(self.game)))
+        before = self.tree_snapshot()
+        self.install("proxy")
+        self.assertEqual([], self.engine.uninstall("123")[1])
+        self.assertEqual(before, self.tree_snapshot())
+
+    def test_game_page_returns_free_proxy_names(self):
+        (self.game / "WinMM.dll").write_bytes(b"owner OptiScaler")
+        with patch.object(main, "require_user"), patch.object(main, "backend", return_value=self.engine), patch.object(metadata, "dlcs", return_value=[]):
+            page = asyncio.run(main.Plugin().get_game_page("123"))
+        self.assertTrue(page["found"])
+        self.assertEqual(["version", "winhttp"], page["available_proxies"])
+
+    def test_darkwood_owner_file_preservation_matrix(self):
+        for name in install_state.APIS:
+            (self.game / name).unlink()
+        files = ("dxgi.dll", "ReShade.ini", "ReShadePreset.ini", "renodx-unityengine.addon64", "Darkwood.exe",
+                 "Darkwood_Data/Plugins/x86/steam_api.dll", "Darkwood_Data/Plugins/x86_64/steam_api64.dll")
+        for name in files:
+            file = self.game / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(("owner " + name).encode())
+        before = self.tree_snapshot()
+        for mode, proxy in [("direct", "version"), *(("proxy", x) for x in install_state.PROXIES), ("proxy", "dxgi")]:
+            with self.subTest(mode=mode, proxy=proxy), patch.object(self.store, "save") as save:
+                message = "Invalid SmokeAPI mode or proxy" if proxy == "dxgi" else "Several Steam API DLL folders"
+                with self.assertRaisesRegex(ValueError, message):
+                    self.engine.install("123", mode, proxy, [], "")
+                save.assert_not_called()
+                self.assertEqual(before, self.tree_snapshot())
+        with self.assertRaisesRegex(ValueError, "No valid install record"):
+            self.engine.uninstall("123")
+        self.assertEqual(before, self.tree_snapshot())
+
+    def test_remnant_owner_file_preservation_matrix(self):
+        folder, = self.unreal_layout("Win64")
+        shipping = self.game / "Remnant" / "Binaries" / "Win64"
+        shipping.mkdir(parents=True)
+        for name in ("Remnant-Win64-Shipping.exe", "dxgi.dll", "winmm.dll"):
+            (shipping / name).write_bytes(("owner " + name).encode())
+        before = self.tree_snapshot()
+        trace = []
+        def confined(function, destination=False):
+            def call(directory, *args, **kwargs):
+                directories = [directory, args[1]] if destination else [directory]
+                for current in directories:
+                    path = (current.path if hasattr(current, "path")
+                            else Path(os.readlink(f"/proc/self/fd/{current.fd}")))
+                    if path == self.game or self.game in path.parents:
+                        self.assertTrue(path == folder or folder in path.parents, str(path))
+                        trace.append((function.__name__, path.relative_to(self.game).as_posix(), args[0]))
+                return function(directory, *args, **kwargs)
+            return call
+        with ExitStack() as stack:
+            for method in ("write_new", "raw_rename", "move_to", "raw_delete", "create_probe", "remove_probe", "remove_probe_file"):
+                stack.enter_context(patch.object(TestDirectory, method, confined(getattr(TestDirectory, method), method == "move_to")))
+            record = self.install()
+            self.assertEqual(str(folder), record["game_dir"])
+            self.assertTrue(trace)
+            installed = self.tree_snapshot()
+            for name in installed.keys() - before.keys():
+                self.assertEqual(folder, (self.game / name).parent)
+            for name in before:
+                if name != (folder / "steam_api64.dll").relative_to(self.game).as_posix():
+                    self.assertEqual(before[name], installed[name])
+            self.assertEqual([], self.engine.uninstall("123")[1])
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual([], smokeapi.available_proxies(str(self.game)))
+        for proxy in (*install_state.PROXIES, "dxgi"):
+            with self.subTest(proxy=proxy), patch.object(self.store, "save") as save:
+                message = "Invalid SmokeAPI mode or proxy" if proxy == "dxgi" else "Proxy mode"
+                with self.assertRaisesRegex(ValueError, message):
+                    self.engine.install("123", "proxy", proxy, [], "")
+                save.assert_not_called()
+                self.assertEqual(before, self.tree_snapshot())
 
     def test_missing_api_refusal_names_the_cause(self):
         for name in install_state.APIS:

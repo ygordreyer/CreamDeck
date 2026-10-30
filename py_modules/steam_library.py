@@ -104,8 +104,11 @@ def confined_game(library, install_dir):
     path = os.path.join(common, install_dir)
     if os.path.commonpath([os.path.realpath(common), os.path.realpath(path)]) != os.path.realpath(common):
         raise ValueError("Game directory escapes steamapps/common")
-    with Directory(path):
-        pass
+    try:
+        with Directory(path):
+            pass
+    except FileNotFoundError as error:
+        raise ValueError("Steam game is not installed: game folder is missing") from error
     return path
 
 
@@ -122,8 +125,11 @@ def find_game(value):
         flags = get_child(data, "StateFlags")
         if flags is not None and (not isinstance(flags, str) or not re.fullmatch(r"[0-9]+", flags)):
             raise ValueError("Invalid manifest StateFlags")
+        updating = bool(int(flags) & UPDATE_RUNNING_FLAGS) if flags is not None else False
+        if flags is not None and not int(flags) & 4 and not updating:
+            raise ValueError("Steam game is not installed")
         return {"app_id": value, "name": get_child(data, "name") or value,
                 "game_directory": confined_game(library, get_child(data, "installdir")),
-                "updating": bool(int(flags) & UPDATE_RUNNING_FLAGS) if flags is not None else False,
+                "updating": updating,
                 "update_state_checked": flags is not None}
     raise ValueError("Installed Steam game not found")

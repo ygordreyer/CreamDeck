@@ -15,6 +15,7 @@ export interface GamePage {
   name?: string;
   status?: string;
   allowed?: boolean;
+  available_proxies?: string[];
   record?: InstallRecord | null;
   dlcs?: { id: string; name: string }[];
   error?: string;

@@ -13,6 +13,7 @@ from resource_files import verified_resources
 from steam_library import assert_game_idle
 
 CHANGED = "game changed since install, run Verify integrity in Steam"
+SCAN_DEPTH = 16
 
 
 def anti_cheat(directory):
@@ -25,13 +26,15 @@ def anti_cheat(directory):
                 raise ValueError(f"Anti-cheat marker found: {name}")
             if stat.S_ISLNK(info.st_mode):
                 raise ValueError(f"Symlink in game scan: {name}")
-            if depth and stat.S_ISDIR(info.st_mode):
+            if stat.S_ISDIR(info.st_mode):
+                if not depth:
+                    raise ValueError(f"Anti-cheat scan incomplete: folders beyond the {SCAN_DEPTH}-folder limit were not checked")
                 with folder.child(name) as child:
                     scan(child, depth - 1)
-    scan(directory, 1)
+    scan(directory, SCAN_DEPTH)
 
 
-def api_directory(root, depth=16):
+def api_directory(root, depth=SCAN_DEPTH):
     """Top level if it has a Steam API DLL, else the one nested folder that does (Unreal keeps it under Engine/Binaries/ThirdParty)."""
     found, variants, native, truncated = [], [], [], []
 
@@ -65,6 +68,19 @@ def api_directory(root, depth=16):
     return found[0]
 
 
+def available_proxies(root):
+    try:
+        path = api_directory(root)
+        if path != root:
+            return []
+        with Directory(path) as directory:
+            present = {name.casefold() for name, _ in directory.entries()}
+        return [name for name in PROXIES if name + ".dll" not in present]
+    except (ValueError, OSError):
+        # Availability is advisory. Install repeats resolution and all safety checks.
+        return []
+
+
 def inside_game(game, record):
     root = game["game_directory"]
     return os.path.commonpath([root, record["game_dir"]]) == root
@@ -79,7 +95,7 @@ class Installer:
         with LOCK:
             value = app_id(value)
             records = self.store.all()
-            if any(r["app_id"] == value and r["launch_restore"] == "pending" for r in records):
+            if any(r["app_id"] == value and r["mode"] == "proxy" and r["launch_restore"] == "pending" for r in records):
                 raise ValueError("Launch options restoration is pending. Restore them or explicitly resolve by hand first")
             if any(r["phase"] != "removed" for r in records):
                 raise ValueError("Remove or recover the recorded installation first. Only one game at a time")
@@ -107,16 +123,19 @@ class Installer:
             if mode == "proxy" and path != game["game_directory"]:
                 raise ValueError("Proxy mode needs the Steam API DLL in the game's top folder. Use direct mode")
             with Directory(path) as directory:
-                directory.rename_preflight()
                 originals = {name: directory.hash(name) for name in APIS if directory.exists(name)}
                 if not originals:
                     raise ValueError("No supported Windows Steam API DLL found in the game folder")
                 # Wine resolves DLL names case-insensitively, so any letter-case alias is a collision.
                 present = {name.casefold(): name for name, _ in directory.entries()}
                 for name in (*[x.replace(".dll", "_o.dll") for x in APIS], CONFIG,
-                             *(x + ".dll" for x in PROXIES), ".dlc_unlocker_proxy.json"):
+                             *([proxy + ".dll"] if mode == "proxy" else []), ".dlc_unlocker_proxy.json"):
                     if name.casefold() in present:
                         raise ValueError(f"Foreign file already exists: {present[name.casefold()]}")
+                foreign_proxies = ({name: directory.hash(name) for name, _ in directory.entries()
+                                    if name.casefold() in {x + ".dll" for x in PROXIES}}
+                                   if mode == "direct" else {})
+                directory.rename_preflight()
                 config = {"$version": 4, "logging": False, "log_steam_http": False,
                           "default_app_status": "original", "override_app_status": {},
                           "override_dlc_status": {x: "unlocked" for x in enabled},
@@ -136,7 +155,8 @@ class Installer:
                           "created": created, "stages": {name: ".cdh-" + uuid.uuid4().hex for name in payload},
                           "phase": "installing", "original_launch_options": original_launch,
                           "set_launch_options": desired, "enabled_dlc_ids": enabled,
-                          "quarantine": {}, "launch_restore": "acknowledged"}
+                          "quarantine": {}, "launch_restore": "acknowledged",
+                          "foreign_proxies": foreign_proxies}
                 self.store.save(record)
                 directory.bind_journal(record, self.store.save)
                 try:
@@ -214,9 +234,16 @@ class Installer:
             raise ValueError("Manifest game directory changed. Inspect the record manually")
         assert_game_idle(game, ignored_fds=(getattr(directory, "fd", None),))
         directory.bind_journal(record, self.store.save)
-        record["launch_restore"] = "pending"
+        record["launch_restore"] = "pending" if record["mode"] == "proxy" else "acknowledged"
         self.store.save(record)
         warnings = directory.recover_quarantine()
+        for name, sha in record["foreign_proxies"].items():
+            try:
+                unchanged = directory.hash(name) == sha
+            except (ValueError, OSError):
+                unchanged = False
+            if not unchanged:
+                warnings.append(f"Foreign proxy changed since install ({name}); left alone")
         # Check remaining names before starting fresh mutations.
         names = set(record["installed"]) | set(record["created"]) | set(record["stages"].values())
         hashes = {name: directory.hash(name) for name in names}
