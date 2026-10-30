@@ -1,17 +1,23 @@
-import { ButtonItem, Dropdown, Focusable, PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
+import { ButtonItem, Dropdown, Focusable, PanelSection, PanelSectionRow, ToggleField, useParams } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
 import { acknowledgeLaunchRestore, allowGame, checked, GamePage, getGamePage, installSmokeAPI, resolveLaunchByHand, uninstallSmokeAPI } from "../utils/backend";
-import { appIdFromPath } from "../utils/route";
+import { pageAppId } from "../utils/route";
 import { changeLaunchOptions, getAppLaunchOptions } from "../utils/wineDllOverride";
 
-export default function CreamDeckPage() {
-  const appId = appIdFromPath(window.location.pathname);
+// Keyed on the app id so every game gets fresh page state.
+export default function CreamDeckRoute() {
+  const params = typeof useParams === "function" ? useParams<{ appid?: string }>() : undefined;
+  const appId = pageAppId(params?.appid, window.location.pathname);
+  return <CreamDeckPage key={appId} appId={appId} />;
+}
+
+function CreamDeckPage({ appId }: { appId: string }) {
   const [page, setPage] = useState<GamePage>({ found: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [confirmed, setConfirmed] = useState(false);
-  const [mode, setMode] = useState("proxy");
+  const [mode, setMode] = useState("direct");
   const [proxy, setProxy] = useState("version");
   const [manualLaunch, setManualLaunch] = useState(false);
   const [enabled, setEnabled] = useState<string[]>([]);
@@ -93,7 +99,7 @@ export default function CreamDeckPage() {
     </PanelSection>
     <PanelSection title="SmokeAPI">
       <p>Close the game first. One recorded game at a time. DLC files must already be installed.</p>
-      <PanelSectionRow><Dropdown selectedOption={mode} rgOptions={[{ label: "Proxy", data: "proxy" }, { label: "Direct", data: "direct" }]} onChange={(x) => setMode(x.data)} /></PanelSectionRow>
+      <PanelSectionRow><Dropdown selectedOption={mode} rgOptions={[{ label: "Direct", data: "direct" }, { label: "Proxy", data: "proxy" }]} onChange={(x) => setMode(x.data)} /></PanelSectionRow>
       {mode === "proxy" && <PanelSectionRow><Dropdown selectedOption={proxy} rgOptions={["version", "winmm", "winhttp"].map((x) => ({ label: x, data: x }))} onChange={(x) => setProxy(x.data)} /></PanelSectionRow>}
       <p>Proxy mode supports empty options, %command%, or a simple path followed by %command%. Other syntax requires manual setup.</p>
       {mode === "proxy" && <PanelSectionRow><ToggleField label="For complex options, I will set the Wine override and restore the original manually" checked={manualLaunch} onChange={setManualLaunch} /></PanelSectionRow>}

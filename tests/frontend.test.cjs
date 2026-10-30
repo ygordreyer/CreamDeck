@@ -183,3 +183,12 @@ test("app id parses from Steam's routed page path", () => {
     assert.equal(appIdFromPath(bad), "", bad);
   }
 });
+
+test("the route param picks the page's game, so an in-place route change cannot keep the old one", () => {
+  const { pageAppId } = load("src/utils/route.ts");
+  assert.equal(pageAppId("482400", "/routes/creamdeck-hardened/617290"), "482400");
+  assert.equal(pageAppId(undefined, "/routes/creamdeck-hardened/617290"), "617290");
+  for (const bad of ["0123", "12345678901", "12x", "../1", ""]) {
+    assert.equal(pageAppId(bad, "/routes/creamdeck-hardened/617290"), "", bad);
+  }
+});

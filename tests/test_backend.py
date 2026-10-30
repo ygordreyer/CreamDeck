@@ -737,6 +737,40 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(original, record["original_launch_options"])
         self.assertEqual([], self.engine.uninstall("123")[1])
 
+    def unreal_layout(self, *arches):
+        for name in install_state.APIS:
+            (self.game / name).unlink()
+        folders = []
+        for arch in arches:
+            folder = self.game / "Engine" / "Binaries" / "ThirdParty" / "Steamworks" / "Steamv139" / arch
+            folder.mkdir(parents=True)
+            (folder / "steam_api64.dll").write_bytes(b"original nested DLL")
+            folders.append(folder)
+        return folders
+
+    def test_unreal_nested_steam_api_installs_beside_it_and_removes_byte_exact(self):
+        folder, = self.unreal_layout("Win64")
+        before = {x.name: x.read_bytes() for x in folder.iterdir()}
+        top = self.snapshot()
+        record = self.install()
+        self.assertEqual(str(folder), record["game_dir"])
+        self.assertEqual({"steam_api64.dll", "steam_api64_o.dll", install_state.CONFIG}, {x.name for x in folder.iterdir()})
+        self.assertEqual(top, self.snapshot())
+        self.assertEqual("installed", self.engine.status("123")[0])
+        self.assertEqual([], self.engine.uninstall("123")[1])
+        self.assertEqual(before, {x.name: x.read_bytes() for x in folder.iterdir()})
+
+    def test_unreal_nested_steam_api_refuses_proxy_and_ambiguous_folders(self):
+        win64, = self.unreal_layout("Win64")
+        with self.assertRaisesRegex(ValueError, "Proxy mode"):
+            self.install("proxy")
+        win32 = win64.parent / "Win32"
+        win32.mkdir()
+        (win32 / "steam_api.dll").write_bytes(b"original nested 32-bit DLL")
+        with self.assertRaisesRegex(ValueError, "Several Steam API DLL folders"):
+            self.install()
+        self.assertEqual({"steam_api64.dll"}, {x.name for x in win64.iterdir()})
+
     def test_library_paths_must_be_absolute_existing(self):
         for path in ("relative", str(self.base / "missing")):
             (self.library / "libraryfolders.vdf").write_text('"libraryfolders" { "1" { "path" "' + path.replace("\\", "\\\\") + '" } }')

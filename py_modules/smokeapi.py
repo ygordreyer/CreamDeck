@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import stat
 import uuid
 
@@ -28,6 +29,35 @@ def anti_cheat(directory):
                 with folder.child(name) as child:
                     scan(child, depth - 1)
     scan(directory, 1)
+
+
+def api_directory(root, depth=8):
+    """Top level if it has a Steam API DLL, else the one nested folder that does (Unreal keeps it under Engine/Binaries/ThirdParty)."""
+    found = []
+
+    def scan(folder, path, depth):
+        entries = folder.entries()
+        if any(name in APIS and stat.S_ISREG(info.st_mode) for name, info in entries):
+            found.append(path)
+        if depth:
+            for name, info in entries:
+                if stat.S_ISDIR(info.st_mode):
+                    with folder.child(name) as child:
+                        scan(child, os.path.join(path, name), depth - 1)
+    with Directory(root) as directory:
+        if any(directory.exists(name) for name in APIS):
+            return root
+        scan(directory, root, depth)
+    if not found:
+        raise ValueError("No Windows Steam API DLL in the game folder. Use the Proton game build")
+    if len(found) > 1:
+        raise ValueError("Several Steam API DLL folders found. Refusing to pick one")
+    return found[0]
+
+
+def inside_game(game, record):
+    root = game["game_directory"]
+    return os.path.commonpath([root, record["game_dir"]]) == root
 
 
 class Installer:
@@ -61,12 +91,16 @@ class Installer:
             game = self.find_game(value)
             assert_game_idle(game)
             resources = verified_resources()
-            with Directory(game["game_directory"]) as directory:
-                anti_cheat(directory)
+            with Directory(game["game_directory"]) as root:
+                anti_cheat(root)
+            path = api_directory(game["game_directory"])
+            if mode == "proxy" and path != game["game_directory"]:
+                raise ValueError("Proxy mode needs the Steam API DLL in the game's top folder. Use direct mode")
+            with Directory(path) as directory:
                 directory.rename_preflight()
                 originals = {name: directory.hash(name) for name in APIS if directory.exists(name)}
                 if not originals:
-                    raise ValueError("No top-level Windows Steam API DLL. Use the Proton game build")
+                    raise ValueError("No Windows Steam API DLL in the game folder. Use the Proton game build")
                 for name in (*[x.replace(".dll", "_o.dll") for x in APIS], CONFIG,
                              *(x + ".dll" for x in PROXIES), ".dlc_unlocker_proxy.json"):
                     if directory.exists(name):
@@ -84,7 +118,7 @@ class Installer:
                         raise ValueError("Ambiguous proxy architecture. Use direct mode")
                     payload[proxy + ".dll"] = resources[next(iter(originals))]
                     created = list(payload)
-                record = {"schema": 1, "app_id": value, "game_dir": game["game_directory"],
+                record = {"schema": 1, "app_id": value, "game_dir": path,
                           "mode": mode, "proxy_name": proxy, "originals": originals,
                           "installed": {name: digest(data) for name, data in payload.items()},
                           "created": created, "stages": {name: ".cdh-" + uuid.uuid4().hex for name in payload},
@@ -118,7 +152,7 @@ class Installer:
             if not record or record["phase"] == "removed":
                 return "not installed", record
             game = self.find_game(value)
-            if game["game_directory"] != record["game_dir"]:
+            if not inside_game(game, record):
                 return "game directory changed", record
             with Directory(record["game_dir"]) as directory:
                 if record["phase"] != "installed":
@@ -141,7 +175,7 @@ class Installer:
             if record["phase"] == "removed":
                 return record, []
             game = self.find_game(value)
-            if game["game_directory"] != record["game_dir"]:
+            if not inside_game(game, record):
                 raise ValueError("Manifest game directory changed. Inspect the record manually")
             assert_game_idle(game)
             with Directory(record["game_dir"]) as directory:
@@ -164,7 +198,7 @@ class Installer:
         # Rollback also rechecks for writers. Only our own directory handle
         # is exempt; its presence is inherent to descriptor-relative cleanup.
         game = self.find_game(record["app_id"])
-        if game["game_directory"] != record["game_dir"]:
+        if not inside_game(game, record):
             raise ValueError("Manifest game directory changed. Inspect the record manually")
         assert_game_idle(game, ignored_fds=(getattr(directory, "fd", None),))
         directory.bind_journal(record, self.store.save)
