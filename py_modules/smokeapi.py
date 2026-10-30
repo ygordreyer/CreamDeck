@@ -237,13 +237,14 @@ class Installer:
         record["launch_restore"] = "pending" if record["mode"] == "proxy" else "acknowledged"
         self.store.save(record)
         warnings = directory.recover_quarantine()
+        advisories = []
         for name, sha in record["foreign_proxies"].items():
             try:
                 unchanged = directory.hash(name) == sha
             except (ValueError, OSError):
                 unchanged = False
             if not unchanged:
-                warnings.append(f"Foreign proxy changed since install ({name}); left alone")
+                advisories.append(f"Foreign proxy changed since install ({name}); left alone")
         # Check remaining names before starting fresh mutations.
         names = set(record["installed"]) | set(record["created"]) | set(record["stages"].values())
         hashes = {name: directory.hash(name) for name in names}
@@ -297,4 +298,4 @@ class Installer:
                 raise
         if rollback and warnings:
             raise RuntimeError("Install rollback needs recovery: " + "; ".join(warnings))
-        return warnings
+        return warnings + advisories

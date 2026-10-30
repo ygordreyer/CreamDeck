@@ -954,15 +954,80 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(before, self.tree_snapshot())
 
     def test_direct_changed_foreign_proxy_warns_and_preserves_identity(self):
+        self.assert_foreign_proxy_change_is_advisory(deleted=False)
+
+    def test_direct_deleted_foreign_proxy_warns_without_blocking_removal(self):
+        self.assert_foreign_proxy_change_is_advisory(deleted=True)
+
+    def assert_foreign_proxy_change_is_advisory(self, deleted):
+        file = self.game / "WinMM.dll"
+        file.write_bytes(b"owner OptiScaler")
+        self.install()
+        if deleted:
+            file.unlink()
+        else:
+            file.write_bytes(b"owner OptiScaler update")
+        changed = self.tree_snapshot().get("WinMM.dll")
+        record, warnings = self.engine.uninstall("123")
+        self.assertEqual(["Foreign proxy changed since install (WinMM.dll); left alone"], warnings)
+        self.assertEqual("removed", record["phase"])
+        self.assertEqual("acknowledged", record["launch_restore"])
+        self.assertEqual(changed, self.tree_snapshot().get("WinMM.dll"))
+        self.assertEqual(self.before, {name: data for name, data in self.snapshot().items() if name != "WinMM.dll"})
+
+        restarted = smokeapi.Installer(install_state.Store(str(self.settings)), steam_library.find_game)
+        recovered, warnings = restarted.uninstall("123")
+        self.assertEqual("removed", recovered["phase"])
+        self.assertEqual([], warnings)
+        other = self.game.parent / "Other"
+        other.mkdir()
+        (other / "steam_api64.dll").write_bytes(b"other original DLL")
+        self.manifest("Other", "456")
+        self.store.allow("456", True)
+        self.assertEqual("installed", restarted.install("456", "direct", "version", [], "")["phase"])
+        self.assertEqual("removed", restarted.uninstall("123")[0]["phase"])
+        self.assertEqual("installed", restarted.status("456")[0])
+        self.assertEqual(changed, self.tree_snapshot().get("WinMM.dll"))
+        self.assertEqual(self.before, {name: data for name, data in self.snapshot().items() if name != "WinMM.dll"})
+
+    def test_real_cleanup_warning_still_blocks_removal_with_changed_foreign_proxy(self):
         file = self.game / "WinMM.dll"
         file.write_bytes(b"owner OptiScaler")
         self.install()
         file.write_bytes(b"owner OptiScaler update")
-        changed = self.tree_snapshot()["WinMM.dll"]
-        record, warnings = self.engine.uninstall("123")
-        self.assertTrue(any("Foreign proxy changed" in warning and "WinMM.dll" in warning for warning in warnings))
-        self.assertEqual(changed, self.tree_snapshot()["WinMM.dll"])
-        self.assertEqual("acknowledged", record["launch_restore"])
+        (self.game / install_state.CONFIG).write_bytes(b"owner config")
+        changed = self.tree_snapshot()
+        for _ in range(2):
+            record, warnings = self.engine.uninstall("123")
+            self.assertEqual("removing", record["phase"])
+            self.assertEqual("removing", self.store.load("123")["phase"])
+            self.assertIn("Foreign proxy changed since install (WinMM.dll); left alone", warnings)
+            self.assertIn(smokeapi.CHANGED + f" ({install_state.CONFIG}); file left alone", warnings)
+            for name in ("WinMM.dll", install_state.CONFIG):
+                self.assertEqual(changed[name], self.tree_snapshot()[name])
+            for name in install_state.APIS:
+                self.assertEqual(self.before[name], (self.game / name).read_bytes())
+
+    def test_changed_foreign_proxy_does_not_turn_install_rollback_into_failure(self):
+        file = self.game / "WinMM.dll"
+        file.write_bytes(b"owner OptiScaler")
+        rename = TestDirectory.rename
+        count = 0
+        failure = OSError("simulated rename failure")
+        def fail(directory, source, target, expected):
+            nonlocal count
+            count += 1
+            if count == 3:
+                file.write_bytes(b"owner OptiScaler update")
+                raise failure
+            return rename(directory, source, target, expected)
+        with patch.object(TestDirectory, "rename", fail):
+            with self.assertRaises(OSError) as error:
+                self.install()
+        self.assertIs(failure, error.exception)
+        self.assertEqual("removed", self.store.load("123")["phase"])
+        self.assertEqual(b"owner OptiScaler update", file.read_bytes())
+        self.assertEqual(self.before, {name: data for name, data in self.snapshot().items() if name != "WinMM.dll"})
 
     def test_foreign_proxy_schema_rejects_unsafe_names_and_hashes(self):
         record = self.install()
