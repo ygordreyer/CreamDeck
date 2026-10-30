@@ -143,7 +143,10 @@ def find_game(value):
 def relative_executable(value):
     if not isinstance(value, str):
         return None
-    value = value.replace("\\", "/").removeprefix("./")
+    value = value.replace("\\", "/")
+    if value.startswith("/") and not value.startswith("//"):
+        value = value[1:]
+    value = value.removeprefix("./")
     if ":" in value or "\0" in value or any(x in ("", ".", "..") for x in value.split("/")):
         return None
     return value
@@ -165,7 +168,9 @@ def launch_executables(value):
         user = get_child(manifest, "UserConfig", "BetaKey")
         if any(branch is not None and not isinstance(branch, str) for branch in (mounted, user)):
             return []
-        branch = mounted or user or "public"
+        branch = (mounted or user or "public").casefold()
+        if re.search(r"[,\s;|]", branch):
+            return []
         result = []
         for entry in launch_entries(os.path.join(steam_root(), "appcache"), value):
             config = get_child(entry, "config")
@@ -182,10 +187,19 @@ def launch_executables(value):
             if systems is not None:
                 if "windows" not in {x.strip().casefold() for x in systems.split(",")}:
                     continue
-            if beta is not None and beta.casefold() != branch.casefold():
-                continue
             if arch is not None and arch not in ("64", 64):
                 continue
+            if beta is not None:
+                tokens = {token.casefold() for token in re.split(r"[, \t\r\n\v\f;|]+", beta) if token}
+                if branch in tokens or (branch == "public" and "default" in tokens):
+                    # Matching through an unverified separator cannot select a launch.
+                    if ";" in beta or "|" in beta:
+                        return []
+                elif not tokens or "default" in tokens:
+                    # Steam's default fallback on non-public branches is unknown.
+                    return []
+                else:
+                    continue
             executable = relative_executable(get_child(entry, "executable"))
             if executable is not None:
                 result.append(executable)

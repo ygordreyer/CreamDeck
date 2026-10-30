@@ -213,7 +213,7 @@ class AppinfoTests(unittest.TestCase):
                 ('"UserConfig" { "BetaKey" "" }', "PUBLIC", True),
                 ('"MountedConfig" { "BetaKey" "" } "UserConfig" { "BetaKey" "preview" }', "Preview", True),
                 ('"MountedConfig" { "BetaKey" "nightly" } "UserConfig" { "BetaKey" "preview" }', "nightly", True),
-                ("", "public,preview", False),
+                ("", "public,preview", True),
                 ('"MountedConfig" { "BetaKey" "public,preview" }', "public", False)):
             with self.subTest(extra=extra, beta=beta):
                 self.manifest(extra)
@@ -354,7 +354,7 @@ class AppinfoTests(unittest.TestCase):
 
     def test_unsafe_executables_are_ignored(self):
         self.folders("Release", "Ship")
-        for path in ("../Ship/Hades2.exe", "Ship/../Hades2.exe", "/x", r"C:\x", "C:x",
+        for path in ("../Ship/Hades2.exe", "Ship/../Hades2.exe", "//x", "/", "/../x", "/C:/x", r"C:\x", "C:x",
                      "Ship//Hades2.exe", "Ship/./Hades2.exe", "", "Ship/", r"\\host\x"):
             with self.subTest(path=path):
                 self.write_launches(launch(path))
