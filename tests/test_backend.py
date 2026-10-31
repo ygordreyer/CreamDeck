@@ -100,6 +100,127 @@ class BackendTests(unittest.TestCase):
     def install(self, mode="direct", original=""):
         return self.engine.install("123", mode, "version", [], original)
 
+    def test_recorded_games_list_is_read_only_and_includes_setup_and_recovery(self):
+        self.install()
+        self.other_game()
+        self.engine.install("456", "proxy", "version", [], "")
+        # A legacy journal must not migrate just because the QAM opens.
+        path = self.settings / "123.json"
+        legacy = json.loads(path.read_text())
+        legacy.pop("game_directory", None)
+        path.write_text(json.dumps(legacy))
+        before = self.tree_snapshot(self.base)
+        with patch.object(main, "require_user"), \
+                patch.object(install_state.Store, "_replace", side_effect=AssertionError("QAM wrote settings")), \
+                patch.object(TestDirectory, "ensure_child_dir", side_effect=AssertionError("QAM created settings")):
+            result = asyncio.run(main.Plugin().get_recorded_games())
+        self.assertEqual({"games": [
+            {"app_id": "123", "name": "Example", "state": "Installed"},
+            {"app_id": "456", "name": "Example", "state": "Setup pending"},
+        ]}, result)
+        self.assertEqual(before, self.tree_snapshot(self.base))
+        record = self.store.load("456")
+        record["phase"] = "removing"
+        self.store.save(record)
+        with patch.object(main, "require_user"), patch.object(main.steam_library, "find_game", side_effect=ValueError("Storage unavailable")):
+            result = asyncio.run(main.Plugin().get_recorded_games())
+        self.assertEqual({"app_id": "456", "name": "Steam app 456", "state": "Recovery needed"}, result["games"][1])
+        self.assertTrue(all(len(game["state"]) <= 30 for game in result["games"]))
+
+    def test_recorded_games_list_retains_pending_restore_but_omits_completed_removal(self):
+        (self.game / "steam_api.dll").unlink()
+        self.install("proxy")
+        self.engine.uninstall("123")
+        with patch.object(main, "require_user"):
+            result = asyncio.run(main.Plugin().get_recorded_games())
+            self.assertEqual("Restoration pending", result["games"][0]["state"])
+            self.engine.resolve_launch("123")
+            self.assertEqual({"games": []}, asyncio.run(main.Plugin().get_recorded_games()))
+
+    def test_recorded_games_empty_settings_do_not_create_a_directory(self):
+        missing = self.base / "missing-settings"
+        with patch.object(main, "require_user"), patch.object(decky, "DECKY_PLUGIN_SETTINGS_DIR", str(missing)):
+            self.assertEqual({"games": []}, asyncio.run(main.Plugin().get_recorded_games()))
+        self.assertFalse(missing.exists())
+
+    def test_recorded_games_malformed_record_reports_read_failure_without_writes(self):
+        (self.settings / "123.json").write_text("{}")
+        before = self.tree_snapshot(self.base)
+        with patch.object(main, "require_user"):
+            result = asyncio.run(main.Plugin().get_recorded_games())
+        self.assertIn("error", result)
+        self.assertEqual([], result["games"])
+        self.assertEqual(before, self.tree_snapshot(self.base))
+
+    def test_recorded_games_record_budget(self):
+        template = self.install()
+        (self.settings / "123.json").unlink()
+        for value in range(1000, 1256):
+            (self.settings / f"{value}.json").write_text(json.dumps({**template, "app_id": str(value)}))
+        with patch.object(main, "require_user"), patch.object(main.steam_library, "find_game", return_value={"name": "Game"}) as find:
+            self.assertEqual(256, len(asyncio.run(main.Plugin().get_recorded_games())["games"]))
+            find.reset_mock()
+            (self.settings / "1256.json").write_text(json.dumps({**template, "app_id": "1256"}))
+            result = asyncio.run(main.Plugin().get_recorded_games())
+        self.assertEqual({"games": [], "error": "Recorded games unavailable"}, result)
+        find.assert_not_called()
+
+    def test_recorded_games_total_byte_budget(self):
+        template = self.install()
+        (self.settings / "123.json").unlink()
+        for value in range(1000, 1064):
+            payload = json.dumps({**template, "app_id": str(value)}).encode()
+            (self.settings / f"{value}.json").write_bytes(payload.ljust(128 * 1024, b" "))
+        with patch.object(main, "require_user"), patch.object(main.steam_library, "find_game", return_value={"name": "Game"}) as find:
+            self.assertEqual(64, len(asyncio.run(main.Plugin().get_recorded_games())["games"]))
+            find.reset_mock()
+            payload = json.dumps({**template, "app_id": "1064"}).encode()
+            (self.settings / "1064.json").write_bytes(payload.ljust(128 * 1024, b" "))
+            result = asyncio.run(main.Plugin().get_recorded_games())
+        self.assertEqual({"games": [], "error": "Recorded games unavailable"}, result)
+        find.assert_not_called()
+
+    def test_recorded_games_manifest_lookups_release_shared_lock(self):
+        self.install()
+        observed = []
+
+        def lookup(value):
+            # A different thread must be able to mutate while manifests are read.
+            def acquire():
+                acquired = install_state.LOCK.acquire(blocking=False)
+                if acquired:
+                    install_state.LOCK.release()
+                return acquired
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                observed.append(pool.submit(acquire).result(timeout=2))
+            return {"name": "Game"}
+
+        with patch.object(main, "require_user"), patch.object(main.steam_library, "find_game", side_effect=lookup):
+            result = asyncio.run(main.Plugin().get_recorded_games())
+        self.assertEqual(1, len(result["games"]))
+        self.assertEqual([True], observed)
+
+    def test_recorded_games_directory_scan_budget(self):
+        for value in range(1024):
+            (self.settings / f"ignored-{value}.txt").touch()
+        with patch.object(main, "require_user"):
+            result = asyncio.run(main.Plugin().get_recorded_games())
+        self.assertEqual({"games": [], "error": "Recorded games unavailable"}, result)
+
+    def test_recorded_games_manifest_names_are_safe_strings(self):
+        self.install()
+        manifest = self.library / "appmanifest_123.acf"
+        for raw_name, expected in (
+                ('{ "unexpected" "object" }', "Steam app 123"),
+                ('"   "', "Steam app 123"),
+                ('"' + "x" * 257 + '"', "Steam app 123"),
+                ('"  Example game  "', "Example game")):
+            with self.subTest(raw_name=raw_name):
+                manifest.write_text(f'"AppState" {{ "appid" "123" "name" {raw_name} "installdir" "Example" }}')
+                with patch.object(main, "require_user"):
+                    result = asyncio.run(main.Plugin().get_recorded_games())
+                self.assertEqual(expected, result["games"][0]["name"])
+
     def test_manifest_absolute_traversal_and_separators_rejected(self):
         for name in ("/etc", "../outside", "..", "nested/game", "nested\\game", "C:\\Windows"):
             with self.subTest(name=name):
@@ -2434,6 +2555,97 @@ class RenameCapabilityTests(unittest.TestCase):
 
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_anti_cheat_filename_cannot_forge_operation_log(self):
+        marker = "BEService\nforged log line.exe"
+
+        def refuse(*_):
+            smokeapi.anti_cheat(types.SimpleNamespace(entries=lambda: [(marker, None)]))
+
+        with patch.object(main, "require_user"), patch.object(main, "backend") as backend, \
+                self.assertLogs(decky.logger, level="ERROR") as captured:
+            backend.return_value.install.side_effect = refuse
+            result = await main.Plugin().install_smokeapi("123", "direct", "version", [], "")
+        self.assertEqual({"success": False, "error": f"Anti-cheat marker found: {marker}"}, result)
+        self.assertEqual(1, len(captured.records))
+        line = captured.records[0].getMessage()
+        self.assertNotIn("\n", line)
+        self.assertNotIn(marker, line)
+        self.assertNotIn("BEService", line)
+        self.assertEqual("CreamDeck Hardened install_smokeapi refused for app 123: validation", line)
+
+    async def test_filesystem_filename_is_absent_from_operation_log(self):
+        error = PermissionError(errno.EACCES, "Permission denied", "/home/player/private-token")
+        with patch.object(main, "require_user"), patch.object(main, "backend", side_effect=error), \
+                self.assertLogs(decky.logger, level="ERROR") as captured:
+            result = await main.Plugin().uninstall_smokeapi("456")
+        self.assertEqual({"success": False, "error": str(error)}, result)
+        self.assertEqual(1, len(captured.records))
+        line = captured.records[0].getMessage()
+        self.assertNotIn("\n", line)
+        self.assertNotIn("private-token", line)
+        self.assertNotIn(error.filename, line)
+        self.assertEqual("CreamDeck Hardened uninstall_smokeapi refused for app 456: filesystem error", line)
+
+    async def test_recorded_games_failures_never_return_exception_details(self):
+        for error in (PermissionError(errno.EACCES, "Permission denied", "/home/player/private-token"),
+                      ValueError("private-token\nforged line"), RuntimeError("private-token"),
+                      TypeError("private-token")):
+            with self.subTest(error=type(error).__name__), patch.object(main, "require_user"), \
+                    patch.object(main.Store, "read_records", side_effect=error):
+                result = await main.Plugin().get_recorded_games()
+                self.assertEqual({"games": [], "error": "Recorded games unavailable"}, result)
+                self.assertNotIn("private-token", json.dumps(result))
+
+    async def test_operation_rejected_app_id_logs_fixed_marker(self):
+        for value in ("/home/player/private-token\nforged log line", "123\n", 123, None, "0", "12345678901"):
+            with self.subTest(value=value), patch.object(main, "require_user"), \
+                    patch.object(decky.logger, "error") as log:
+                executed = []
+
+                def operation():
+                    executed.append(value)
+                    safe_fs.app_id(value)
+
+                result = await main.Plugin()._operation(value, operation)
+                self.assertEqual([value], executed)
+                self.assertEqual({"success": False, "error": "App ID must be a positive decimal string"}, result)
+                args = log.call_args.args
+                line = args[0] % args[1:]
+                self.assertEqual("CreamDeck Hardened operation refused for app invalid: validation", line)
+                self.assertNotIn("\n", line)
+
+    async def test_every_operation_refusal_logs_the_app_id(self):
+        plugin = main.Plugin()
+        calls = (
+            plugin.save_dlc_selection("123", []),
+            plugin.acknowledge_launch_setup("123", False),
+            plugin.allow_game("123", True),
+            plugin.acknowledge_launch_restore("123"),
+            plugin.resolve_launch_by_hand("123", True),
+            plugin.install_smokeapi("123", "direct", "version", [], ""),
+            plugin.uninstall_smokeapi("123"),
+        )
+        with patch.object(main, "require_user", side_effect=ValueError("No valid install record. No files were removed")), \
+                patch.object(decky.logger, "error") as log:
+            results = [await call for call in calls]
+            self.assertEqual(7, log.call_count)
+            operations = ("save_dlc_selection", "acknowledge_launch_setup", "allow_game",
+                          "acknowledge_launch_restore", "resolve_launch_by_hand", "install_smokeapi",
+                          "uninstall_smokeapi")
+            for operation, result, logged in zip(operations, results, log.call_args_list):
+                self.assertEqual({"success": False, "error": "No valid install record. No files were removed"}, result)
+                args = logged.args
+                line = args[0] % args[1:]
+                self.assertEqual(f"CreamDeck Hardened {operation} refused for app 123: validation", line)
+
+    async def test_operation_runtime_failure_logs_the_app_id(self):
+        with patch.object(main, "require_user"), patch.object(main, "backend", side_effect=OSError("storage failed")), \
+                patch.object(decky.logger, "error") as log:
+            result = await main.Plugin().uninstall_smokeapi("456")
+        self.assertEqual({"success": False, "error": "storage failed"}, result)
+        args = log.call_args.args
+        self.assertIn("456", args[0] % args[1:])
+
     async def test_plugin_refuses_root_runtime(self):
         with patch.object(main.os, "geteuid", return_value=0, create=True):
             with self.assertRaisesRegex(RuntimeError, "refuses to run as root"):
@@ -2456,6 +2668,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 result = await call
                 self.assertIn("refuses to run as root", result["error"])
                 self.assertFalse(result.get("success", result.get("found")))
+            self.assertEqual({"games": [], "error": "Recorded games unavailable"},
+                             await plugin.get_recorded_games())
             store.assert_not_called()
             find.assert_not_called()
             dlcs.assert_not_called()
@@ -2469,7 +2683,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_rpc_failure_returns_structured_error(self):
         def failure():
             raise ValueError("refused")
-        result = await main.Plugin()._operation(failure)
+        result = await main.Plugin()._operation("123", failure)
         self.assertEqual({"success": False, "error": "refused"}, result)
 
 

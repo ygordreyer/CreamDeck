@@ -5,13 +5,31 @@ import { FaUnlock as PluginIcon } from "react-icons/fa";
 
 import contextMenuPatch, { LibraryContextMenu, menuPatchAvailable, subscribeMenuPatchStatus } from "./patch";
 import CreamDeckPage from "./views/CreamDeckPage";
+import { getRecordedGames, RecordedGame } from "./utils/backend";
 
 const ROUTE = "/creamdeck-hardened/:appid";
 
 function QuickAccessContent() {
   const [available, setAvailable] = useState(menuPatchAvailable());
   const [help, setHelp] = useState(false);
+  const [games, setGames] = useState<RecordedGame[]>([]);
+  const [listStatus, setListStatus] = useState("Loading recorded games");
   useEffect(() => subscribeMenuPatchStatus(setAvailable), []);
+  useEffect(() => {
+    let mounted = true;
+    void getRecordedGames().then((result) => {
+      if (!mounted) return;
+      if (result.error) { setListStatus("Recorded games unavailable"); return; }
+      const records = result.games.filter((game) => /^[1-9][0-9]{0,9}$/.test(game.app_id)).map((game) => {
+        const name = typeof game.name === "string" ? game.name.trim() : "";
+        return { ...game, name: name && name.length <= 256 ? name : `Steam app ${game.app_id}`,
+          state: typeof game.state === "string" ? game.state : "Unavailable" };
+      });
+      setGames(records);
+      setListStatus(records.length ? "" : "No recorded games");
+    }, () => { if (mounted) setListStatus("Recorded games unavailable"); });
+    return () => { mounted = false; };
+  }, []);
   const current = window.location.pathname.match(/\/(?:library\/app|creamdeck-hardened)\/([1-9][0-9]{0,9})\/?$/)?.[1];
   let running: string | undefined;
   try { running = Router?.MainRunningApp?.appid; } catch { /* Steam may not expose the running-app store. */ }
@@ -22,8 +40,12 @@ function QuickAccessContent() {
     }}>Open game</ButtonItem>
     {!appId && <p>Select or run a game</p>}
     {!available && <p role="status">Library menu unavailable</p>}
+    {games.map((game) => <ButtonItem key={game.app_id} onClick={() => {
+      Navigation.CloseSideMenus(); Navigation.Navigate(`/creamdeck-hardened/${game.app_id}`);
+    }}>{game.name} ({game.state})</ButtonItem>)}
+    {listStatus && <p role="status">{listStatus}</p>}
     <ButtonItem onClick={() => setHelp((old) => !old)}>(?)</ButtonItem>
-    {help && <p>Open the selected library game or the running game. Offline single-player games with no anti-cheat only.</p>}
+    {help && <p>Open the selected library game, the running game, or a recorded game. Offline single-player games with no anti-cheat only.</p>}
   </div>;
 }
 

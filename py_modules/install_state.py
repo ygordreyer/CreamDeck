@@ -8,6 +8,11 @@ import steam_library
 from safe_fs import Directory, app_id, component, digest
 
 LOCK = threading.RLock()
+MAX_RECORDS = 256
+MAX_RECORD_BYTES = 8 * 1024 * 1024
+MAX_RECORD_FILE_BYTES = 128 * 1024
+MAX_RECORD_DIRECTORY_ENTRIES = 1024
+RECORDS_UNAVAILABLE = "Recorded games unavailable"
 PROXIES = ("version", "winmm", "winhttp")
 APIS = ("steam_api.dll", "steam_api64.dll")
 CONFIG = "SmokeAPI.config.json"
@@ -186,6 +191,38 @@ def validate(record, value):
 
 
 class Store:
+    @staticmethod
+    @locked
+    def read_records(path):
+        # QAM reads must not create settings or migrate legacy journals.
+        try:
+            directory = Directory(path)
+        except FileNotFoundError:
+            return []
+        with directory:
+            names = []
+            for count, name in enumerate(directory.iter_names(), 1):
+                if count > MAX_RECORD_DIRECTORY_ENTRIES:
+                    raise ValueError(RECORDS_UNAVAILABLE)
+                if name.endswith(".json") and name != "allowlist.json":
+                    if len(names) >= MAX_RECORDS:
+                        raise ValueError(RECORDS_UNAVAILABLE)
+                    names.append(name)
+            records = []
+            remaining = MAX_RECORD_BYTES
+            for name in sorted(names):
+                value = app_id(name[:-5])
+                if remaining <= 0:
+                    raise ValueError(RECORDS_UNAVAILABLE)
+                cap = min(MAX_RECORD_FILE_BYTES, remaining)
+                try:
+                    data = directory.read(name, cap)
+                except ValueError as error:
+                    raise ValueError(RECORDS_UNAVAILABLE) from error
+                remaining -= len(data)
+                records.append(validate(json.loads(data), value))
+            return records
+
     def __init__(self, path):
         if not isinstance(path, str) or not os.path.isabs(path):
             raise ValueError("Settings directory must be absolute")

@@ -77,12 +77,12 @@ test("failed proxy setup stays pending and retry only applies the override", asy
   await h.settle();
   h.nodes().find(x => x.type === "Dropdown").props.onChange({ data: "proxy" }); h.render();
   await h.click("Install");
-  assert.match(h.text(), /Proxy setup pending/);
-  await h.click("Apply launch override");
+  assert.match(h.text(), /Setup pending/);
+  await h.click("Finish launch setup");
   assert.equal(h.calls.filter(x => x[0] === "install").length, 1);
   assert.deepEqual(h.calls.at(-1), ["setup", "123"]);
   assert.equal(options, record.set_launch_options);
-  assert.doesNotMatch(h.text(), /Proxy setup pending/);
+  assert.doesNotMatch(h.text(), /Setup pending/);
 });
 
 test("failed refresh marks stale and disables mutations until refresh succeeds", async () => {
@@ -113,23 +113,125 @@ test("release publication follows build, tests and package verification", () => 
   assert.match(JSON.parse(source("plugin.json")).publish.description, /per-game/i);
 });
 
-function qam({ path = "/routes/library/app/123", running, available = false } = {}) {
-  const navigation = [];
+function qam({ path = "/routes/library/app/123", running, available = false, games = [], failure = false } = {}) {
+  const navigation = [], slots = [], effects = [], cleanups = [], calls = [];
+  let cursor = 0, tree;
   const module = load("src/index.tsx", { window: { location: { pathname: path } }, require(id) {
     if (id === "@decky/api") return { routerHook: { addRoute() {} } };
     if (id === "@decky/ui") return { ButtonItem: "ButtonItem", definePlugin: fn => fn, staticClasses: {}, Router: { MainRunningApp: running ? { appid: running } : undefined }, Navigation: { CloseSideMenus() {}, Navigate(value) { navigation.push(value); } } };
-    if (id === "react") return { useState: value => [value, () => {}], useEffect() {} };
+    if (id === "react") return {
+      useState(value) { const i = cursor++; if (!(i in slots)) slots[i] = value; return [slots[i], next => { slots[i] = typeof next === "function" ? next(slots[i]) : next; }]; },
+      useEffect(fn) { const i = cursor++; if (!(i in slots)) { slots[i] = true; effects.push(fn); } },
+    };
     if (id === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
     if (id === "react-icons/fa") return {};
     if (id === "./patch") return { default: () => undefined, menuPatchAvailable: () => available, subscribeMenuPatchStatus() {} };
     if (id === "./views/CreamDeckPage") return {};
+    if (id === "./utils/backend") return { async getRecordedGames() { calls.push("getRecordedGames"); if (failure) throw Error("read failed"); return { games }; } };
     throw Error(id);
   } });
   const content = module.QuickAccessContent ? undefined : module.default().content;
-  const tree = module.QuickAccessContent ? module.QuickAccessContent() : content.type(content.props);
+  function render() { cursor = 0; tree = module.QuickAccessContent ? module.QuickAccessContent() : content.type(content.props); return tree; }
+  render();
   assert.ok(tree, "QAM exposes a control component");
-  return { tree, navigation };
+  return { get tree() { return tree; }, navigation, calls, async settle() {
+    effects.splice(0).forEach(fn => { const cleanup = fn(); if (cleanup) cleanups.push(cleanup); });
+    await new Promise(resolve => setImmediate(resolve)); render();
+  }, unmount() { cleanups.forEach(fn => fn()); } };
 }
+
+test("QAM record rows open each recorded game's route without a selected game", async () => {
+  const h = qam({ path: "/routes/library/home", games: [
+    { app_id: "123", name: "First game", state: "Installed" },
+    { app_id: "456", name: "Second game", state: "Setup pending" },
+    { app_id: "../789", name: "Invalid game", state: "Installed" },
+  ] });
+  await h.settle();
+  const html = dom(h.tree);
+  assert.match(html, /First game/); assert.match(html, /Installed/);
+  assert.match(html, /Second game/); assert.match(html, /Setup pending/);
+  assert.doesNotMatch(html, /Invalid game/);
+  const buttons = h.tree.props.children.flat(Infinity).filter(x => x?.type === "ButtonItem" && !["Open game", "(?)"].includes(x.props.children));
+  assert.equal(buttons.length, 2);
+  buttons.forEach(button => button.props.onClick());
+  assert.deepEqual(h.navigation, ["/creamdeck-hardened/123", "/creamdeck-hardened/456"]);
+  assert.deepEqual(h.calls, ["getRecordedGames"]);
+});
+
+test("QAM empty records show one short status", async () => {
+  const h = qam({ path: "/routes/library/home", available: true });
+  await h.settle();
+  assert.match(dom(h.tree), /role="status">No recorded games</);
+  assert.equal((dom(h.tree).match(/No recorded games/g) || []).length, 1);
+  assert.deepEqual(h.calls, ["getRecordedGames"]);
+});
+
+test("QAM recorded game names and states render only strings", async () => {
+  for (const name of [{ unexpected: "object" }, ["nested"], null, 123, "", "  ", "x".repeat(257)]) {
+    const h = qam({ games: [{ app_id: "123", name, state: { unexpected: "object" } }] });
+    await h.settle();
+    const row = h.tree.props.children.flat(Infinity).find(x => x?.type === "ButtonItem" && Array.isArray(x.props.children));
+    assert.ok(row, "recorded game row remains reachable");
+    assert.ok(row.props.children.every(child => typeof child === "string"), "React children must be strings");
+    assert.match(dom(row), /Steam app 123/);
+  }
+  const h = qam({ games: [{ app_id: "123", name: "  Trimmed name  ", state: "Installed" }] });
+  await h.settle();
+  assert.match(dom(h.tree), />Trimmed name \(Installed\)</);
+});
+
+test("QAM record read failure stays distinct from an empty list", async () => {
+  const h = qam({ failure: true }); await h.settle();
+  assert.match(dom(h.tree), /Recorded games unavailable/);
+  assert.doesNotMatch(dom(h.tree), /No recorded games/);
+});
+
+test("main-page wording is plain across install choices and recorded states", async () => {
+  const base = { found: true, name: "Game", status: "installed", allowed: true, available_proxies: ["version", "winmm", "winhttp"] };
+  const cases = [
+    { ...base, status: "not installed" },
+    ...["direct", "proxy"].flatMap(mode => ["acknowledged", "pending"].map(launch_setup => ({ ...base,
+      record: { ...record, mode, phase: "installed", launch_setup, launch_restore: "acknowledged" } }))),
+  ];
+  for (const page of cases) {
+    const h = pageHarness({ page }); await h.settle();
+    if (!page.record) { h.nodes().find(x => x.type === "Dropdown").props.onChange({ data: "proxy" }); h.render(); }
+    assert.doesNotMatch(dom(h.tree), /proxy|direct|winedll|override|\.dll|version|winmm|winhttp/i);
+    assert.ok(h.nodes().filter(x => x.props.role === "status").every(x => h.text(x).length <= 30));
+    assert.ok(h.nodes().filter(x => x.type === "ToggleField").every(x => !x.props.label.includes("(?)")));
+  }
+  const h = pageHarness({ page: { ...base, status: "not installed", available_proxies: [] } }); await h.settle();
+  h.nodes().find(x => x.type === "Dropdown").props.onChange({ data: "proxy" }); h.render();
+  assert.doesNotMatch(dom(h.tree), /proxy|direct|winedll|override|\.dll|version|winmm|winhttp/i);
+});
+
+test("help opens immediately under its top-of-page button before long DLC content", async () => {
+  const h = pageHarness(); await h.settle(); await h.click("(?)");
+  const children = h.tree.props.children.flat(Infinity).filter(x => x && typeof x === "object");
+  const help = children.findIndex(x => x.props.role === "dialog");
+  const button = children.findIndex(x => x.type === "ButtonItem" && h.text(x) === "(?)");
+  const dlc = children.findIndex(x => x.type === "PanelSection" && x.props.title === "DLC selection");
+  assert.ok(button >= 0 && button < dlc, "help button precedes scrolling content");
+  assert.equal(help, button + 1, "help is directly under its button");
+  assert.ok(help < dlc);
+  await h.click("Close help");
+  assert.ok(!h.nodes().some(x => x.props.role === "dialog"));
+});
+
+test("refusal details render as a single line of text while retaining the anti-cheat name", async () => {
+  for (const separator of ["\n", "\r\n", "\r", "\u0085", "\u2028", "\u2029"]) {
+    const refusal = `Anti-cheat marker found: BEService${separator}<forged>.exe`;
+    const h = pageHarness({ backend: { async installSmokeAPI() { return { success: false, error: refusal }; } } });
+    await h.settle();
+    await h.click("Install");
+    await h.click("(?)");
+    const details = h.nodes().find(node => node.type === "p" && h.text(node).includes("BEService"));
+    assert.ok(details, "anti-cheat name remains visible in help");
+    assert.equal(details.props.children, "Error: Anti-cheat marker found: BEService <forged>.exe");
+    assert.doesNotMatch(h.text(details), /[\r\n\u0085\u2028\u2029]/);
+    assert.match(dom(details), /BEService &lt;forged>.exe/);
+  }
+});
 
 // Decky adapters emit semantic HTML without mounting Steam or opening a browser.
 function dom(node) {
@@ -170,7 +272,7 @@ test("QAM opens the current or running game and shows a menu-unavailable fallbac
 test("installed mode is loaded, dropdowns are labeled, and an unavailable proxy gives one blocking reason", async () => {
   const active = pageHarness({ page: { found: true, name: "Fake", status: "installed", allowed: true, record: { ...record, phase: "installed", enabled_dlc_ids: [] } } });
   await active.settle();
-  assert.match(active.text(), /Mode:  proxy/);
+  assert.match(active.text(), /Launch helper added/);
   active.page.record.phase = "removed";
   active.page.status = "not installed";
   active.page.available_proxies = ["version"];
@@ -179,8 +281,8 @@ test("installed mode is loaded, dropdowns are labeled, and an unavailable proxy 
   const h = pageHarness({ page: { found: true, name: "Fake", status: "not installed", allowed: true, available_proxies: [] } });
   await h.settle();
   h.nodes().find(x => x.type === "Dropdown").props.onChange({ data: "proxy" }); h.render();
-  assert.deepEqual(h.nodes().filter(x => x.type === "Dropdown").map(x => x.props.menuLabel), ["Install mode", "Proxy DLL"]);
-  assert.match(h.text(), /No free proxy name/);
+  assert.deepEqual(h.nodes().filter(x => x.type === "Dropdown").map(x => x.props.menuLabel), ["Install mode", "Launch helper"]);
+  assert.match(h.text(), /No launch helper available/);
   assert.ok(h.nodes().find(x => x.type === "ButtonItem" && h.text(x) === "Install").props.disabled);
 });
 
@@ -200,7 +302,7 @@ test("controls precede options, disabled reason is visible, help owns explanatio
   assert.ok(!h.nodes().some(x => x.type === "ButtonItem" && /Remove|Recover/.test(h.text(x))));
   const active = pageHarness({ page: { found: true, name: "Selected game", status: "installed", allowed: true, record: { ...record, phase: "installed", enabled_dlc_ids: [], original_launch_options: "x".repeat(8192) } } });
   await active.settle();
-  assert.match(active.text(), /Installed \(proxy\)/);
+  assert.match(active.text(), /Installed/);
   assert.doesNotMatch(active.text(), /x{20}/);
   await active.click("(?)");
   assert.ok(active.nodes().some(x => x.type === "code" && x.props.style.overflowWrap === "anywhere"));
@@ -209,8 +311,11 @@ test("controls precede options, disabled reason is visible, help owns explanatio
 
 test("DOM snapshots cover the twelve offline page states and metadata transitions", async () => {
   const snapshots = {};
-  snapshots["01-qam-active"] = dom(qam().tree);
-  snapshots["02-qam-no-active"] = dom(qam({ path: "/routes/library/home" }).tree);
+  const activeQam = qam({ games: [{ app_id: "123", name: "First game", state: "Installed" }, { app_id: "456", name: "Second game", state: "Setup pending" }] });
+  const emptyQam = qam({ path: "/routes/library/home" });
+  await activeQam.settle(); await emptyQam.settle();
+  snapshots["01-qam-active"] = dom(activeQam.tree);
+  snapshots["02-qam-no-active"] = dom(emptyQam.tree);
   snapshots["03-initial-loading"] = dom(pageHarness().tree);
   const base = { found: true, name: "Selected game", status: "not installed", allowed: true, available_proxies: ["version", "winhttp"] };
   const installed = { ...record, phase: "installed", enabled_dlc_ids: ["456"], launch_restore: "acknowledged", launch_setup: "acknowledged" };

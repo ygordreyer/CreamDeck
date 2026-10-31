@@ -32,6 +32,12 @@ export interface DlcMetadata {
   state: "loading" | "ready" | "unavailable";
   dlcs: { id: string; name: string }[];
 }
+export interface RecordedGame {
+  app_id: string;
+  name: string;
+  state: string;
+}
+export const getRecordedGames = callable<[], { games: RecordedGame[]; error?: string }>("get_recorded_games");
 export const getGamePage = callable<[string], GamePage>("get_game_page");
 export const getGameMetadata = callable<[string], DlcMetadata>("get_game_metadata");
 export const saveDlcSelection = callable<[string, string[]], OperationResult>("save_dlc_selection");

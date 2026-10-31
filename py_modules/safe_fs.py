@@ -82,6 +82,11 @@ class Directory:
     def names(self):
         return os.listdir(self.fd)
 
+    def iter_names(self):
+        with os.scandir(self.fd) as entries:
+            for entry in entries:
+                yield entry.name
+
     def entries(self):
         return [(name, os.stat(name, dir_fd=self.fd, follow_symlinks=False)) for name in self.names()]
 

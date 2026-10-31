@@ -31,6 +31,11 @@ class WindowsTestDirectory(Directory):
     def names(self):
         return os.listdir(self.path)
 
+    def iter_names(self):
+        with os.scandir(self.path) as entries:
+            for entry in entries:
+                yield entry.name
+
     def entries(self):
         return [(x.name, x.lstat()) for x in self.path.iterdir()]
 

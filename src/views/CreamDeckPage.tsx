@@ -99,17 +99,32 @@ function CreamDeckPage({ appId }: { appId: string }) {
   }
   const reason = busy ? "Working" : stale ? "Refresh status first" : !page.found ? "Game unavailable"
     : restorePending ? "Restore launch options first" : active ? "Remove existing install first"
-    : !page.allowed ? "Allow this game first" : mode === "proxy" && !page.available_proxies?.includes(proxy) ? "No free proxy name" : "";
+    : !page.allowed ? "Allow this game first" : mode === "proxy" && !page.available_proxies?.includes(proxy) ? "No launch helper available" : "";
   const status = stale ? (page.found ? "Status stale" : error.toLowerCase().includes("storage unavailable") ? "Storage unavailable" : "Status unavailable")
-    : !page.found ? "Loading status" : restorePending ? "Restoration pending" : setupPending ? "Proxy setup pending"
+    : !page.found ? "Loading status" : restorePending ? "Restoration pending" : setupPending ? "Setup pending"
     : record?.config_update ? "DLC update interrupted" : installed && page.status !== "installed" ? "Recovery needed"
-    : installed ? `Installed (${record.mode})` : active ? "Recovery needed" : "Not installed";
+    : installed ? "Installed" : active ? "Recovery needed" : "Not installed";
 
   return <Focusable style={{ padding: "56px 24px", height: "100%", boxSizing: "border-box", overflowY: "auto", overflowWrap: "anywhere" }}>
     <h1>{page.name || `Steam app ${appId}`}</h1>
     <p role="status">{status}</p>
     {error && <p role="alert">Action failed. See (?)</p>}
     {unsaved && <p role="status">Unsaved selection</p>}
+    <ButtonItem onClick={() => setHelp((old) => !old)}>(?)</ButtonItem>
+    {help && <Focusable role="dialog" aria-label="CreamDeck help" style={{ overflowWrap: "anywhere", whiteSpace: "normal" }}>
+      <h2>Help</h2>
+      <p>Close the game before changing files. Use only offline single-player games with no anti-cheat. Marker scans cannot prove a game is safe. DLC files must already be installed.</p>
+      <p>DLC switches edit the selection. Save applies it to this game only. Refresh discards unsaved edits. Metadata may be unavailable; saved DLC IDs remain available.</p>
+      <p>Replace game files (direct mode) replaces the Steam API DLL. Add a launch helper (proxy mode) needs a free DLL name in the top game folder and a Wine launch override. Helper 1 is version.dll, Helper 2 is winmm.dll, and Helper 3 is winhttp.dll. Simple options can be applied automatically. For complex options, enable manual setup and confirm after setting the override in Steam Properties.</p>
+      <p>Finish launch setup retries Steam options without reinstalling files. Owner edits are preserved. Confirm manual setup only after applying the override yourself.</p>
+      <p>Remove preserves changed files. When recovery reports a mismatch, run Verify integrity in Steam. Confirm manual restore only after restoring the saved original in Steam Properties.</p>
+      {record && <p>Saved original launch options: <code style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{JSON.stringify(record.original_launch_options)}</code></p>}
+      {record?.mode === "proxy" && <p>Required override: <code style={{ overflowWrap: "anywhere" }}>{`WINEDLLOVERRIDES="${record.proxy_name}=n,b"`}</code></p>}
+      {page.status && <p>{page.status}</p>}
+      {error && <p>{error.replace(/[\r\n\u0085\u2028\u2029]+/g, " ")}</p>}
+      {message && <p>{message}</p>}
+      <ButtonItem onClick={() => setHelp(false)}>Close help</ButtonItem>
+    </Focusable>}
     <PanelSection title="DLC selection">
       {metadata.state === "loading" && <p>Loading DLC</p>}
       {metadata.state === "unavailable" && <p>DLC metadata unavailable</p>}
@@ -117,7 +132,7 @@ function CreamDeckPage({ appId }: { appId: string }) {
       {[...dlcs.values()].map((dlc) => <PanelSectionRow key={dlc.id}><ToggleField disabled={!editable} label={dlc.name} checked={enabled.includes(dlc.id)} onChange={(on) => setEnabled((old) => on ? [...new Set([...old, dlc.id])] : old.filter((x) => x !== dlc.id))} /></PanelSectionRow>)}
     </PanelSection>
     <PanelSection title="SmokeAPI">
-      {setupPending && <PanelSectionRow><ButtonItem disabled={locked} onClick={() => void run(async () => { await applySetup(record); await refresh(); })}>Apply launch override</ButtonItem></PanelSectionRow>}
+      {setupPending && <PanelSectionRow><ButtonItem disabled={locked} onClick={() => void run(async () => { await applySetup(record); await refresh(); })}>Finish launch setup</ButtonItem></PanelSectionRow>}
       {setupPending && record.set_launch_options === null && <PanelSectionRow><ButtonItem disabled={locked} onClick={() => void run(async () => {
         checked(await acknowledgeLaunchSetup(appId, true)); await refresh();
       })}>Confirm manual setup</ButtonItem></PanelSectionRow>}
@@ -138,12 +153,12 @@ function CreamDeckPage({ appId }: { appId: string }) {
     </PanelSection>
     <PanelSection title="Options">
       {!active ? <>
-        <PanelSectionRow><label>Install mode</label><Dropdown menuLabel="Install mode" disabled={locked} selectedOption={mode} rgOptions={[{ label: "Direct", data: "direct" }, { label: "Proxy", data: "proxy" }]} onChange={(x) => setMode(x.data)} /></PanelSectionRow>
+        <PanelSectionRow><label>Install mode</label><Dropdown menuLabel="Install mode" disabled={locked} selectedOption={mode} rgOptions={[{ label: "Replace game files", data: "direct" }, { label: "Add a launch helper", data: "proxy" }]} onChange={(x) => setMode(x.data)} /></PanelSectionRow>
         {mode === "proxy" && <>
-          <PanelSectionRow><label>Proxy DLL</label><Dropdown menuLabel="Proxy DLL" disabled={locked} selectedOption={proxy} rgOptions={(page.available_proxies || []).map((x) => ({ label: x, data: x }))} onChange={(x) => setProxy(x.data)} /></PanelSectionRow>
-          <PanelSectionRow><ToggleField disabled={locked} label="Manual launch setup (?)" checked={manualLaunch} onChange={setManualLaunch} /></PanelSectionRow>
+          <PanelSectionRow><label>Launch helper</label><Dropdown menuLabel="Launch helper" disabled={locked} selectedOption={proxy} rgOptions={(page.available_proxies || []).map((x) => ({ label: `Helper ${{ version: 1, winmm: 2, winhttp: 3 }[x] || "?"}`, data: x }))} onChange={(x) => setProxy(x.data)} /></PanelSectionRow>
+          <PanelSectionRow><ToggleField disabled={locked} label="Manual launch setup" checked={manualLaunch} onChange={setManualLaunch} /></PanelSectionRow>
         </>}
-      </> : <p>Mode: {record.mode}</p>}
+      </> : <p>{record.mode === "direct" ? "Game files replaced" : "Launch helper added"}</p>}
       {!page.allowed && <>
         <PanelSectionRow><ToggleField disabled={locked} label="Offline single-player, no anti-cheat" checked={confirmed} onChange={setConfirmed} /></PanelSectionRow>
         <PanelSectionRow><ButtonItem disabled={locked || !confirmed} onClick={() => void run(async () => { checked(await allowGame(appId, confirmed)); await refresh(); })}>Allow game</ButtonItem></PanelSectionRow>
@@ -165,21 +180,6 @@ function CreamDeckPage({ appId }: { appId: string }) {
         })}>Restore launch options</ButtonItem></PanelSectionRow>
         <PanelSectionRow><ButtonItem disabled={locked} onClick={() => void run(async () => { checked(await resolveLaunchByHand(appId, true)); await refresh(); })}>Confirm manual restore</ButtonItem></PanelSectionRow>
       </>}
-      <PanelSectionRow><ButtonItem onClick={() => setHelp((old) => !old)}>(?)</ButtonItem></PanelSectionRow>
     </PanelSection>
-    {help && <Focusable role="dialog" aria-label="CreamDeck help" style={{ overflowWrap: "anywhere", whiteSpace: "normal" }}>
-      <h2>Help</h2>
-      <p>Close the game before changing files. Use only offline single-player games with no anti-cheat. Marker scans cannot prove a game is safe. DLC files must already be installed.</p>
-      <p>DLC switches edit the selection. Save applies it to this game only. Refresh discards unsaved edits. Metadata may be unavailable; saved DLC IDs remain available.</p>
-      <p>Direct mode replaces the Steam API DLL. Proxy mode needs a free DLL name in the top game folder and a Wine launch override. Simple options can be applied automatically. For complex options, enable manual setup and confirm after setting the override in Steam Properties.</p>
-      <p>Apply launch override retries Steam options without reinstalling files. Owner edits are preserved. Confirm manual setup only after applying the override yourself.</p>
-      <p>Remove preserves changed files. When recovery reports a mismatch, run Verify integrity in Steam. Confirm manual restore only after restoring the saved original in Steam Properties.</p>
-      {record && <p>Saved original launch options: <code style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{JSON.stringify(record.original_launch_options)}</code></p>}
-      {record?.mode === "proxy" && <p>Required override: <code style={{ overflowWrap: "anywhere" }}>{`WINEDLLOVERRIDES="${record.proxy_name}=n,b"`}</code></p>}
-      {page.status && <p>{page.status}</p>}
-      {error && <p>{error}</p>}
-      {message && <p>{message}</p>}
-      <ButtonItem onClick={() => setHelp(false)}>Close help</ButtonItem>
-    </Focusable>}
   </Focusable>;
 }
