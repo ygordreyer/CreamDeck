@@ -13,7 +13,7 @@ function load(file, globals = {}) {
   return context.exports;
 }
 const wine = (extra) => load("src/utils/wineDllOverride.ts", extra);
-const record = { mode: "proxy", proxy_name: "version", original_launch_options: "", set_launch_options: 'WINEDLLOVERRIDES="version=n,b" %command%' };
+const record = { app_id: "123", mode: "proxy", proxy_name: "version", original_launch_options: "", set_launch_options: 'WINEDLLOVERRIDES="version=n,b" %command%' };
 
 test("launch-option wrapper validation accepts only supported syntax", () => {
   const { mergeWineDllOverride: merge } = wine();
@@ -69,6 +69,54 @@ test("install launch-option write refuses concurrent user edits", async () => {
     SetAppLaunchOptions() { assert.fail("must not write"); },
   } } });
   assert.match(await changeLaunchOptions(123, record, false), /left untouched/);
+});
+
+test("launch-option changes reject a different game's record before Steam access or acknowledgment", async () => {
+  const { changeLaunchOptions } = wine({ SteamClient: { Apps: {
+    RegisterForAppDetails() { assert.fail("must not read either game's launch options"); },
+    SetAppLaunchOptions() { assert.fail("must not write either game's launch options"); },
+  } } });
+  for (const mode of ["direct", "proxy"]) {
+    for (const restore of [false, true]) {
+      await assert.rejects(changeLaunchOptions(456, { ...record, mode }, restore,
+        async () => { assert.fail("must not acknowledge another game"); }), /different game/);
+    }
+  }
+});
+
+test("installing and restoring one game's launch options preserves the other's exact options", async () => {
+  for (const firstMode of ["direct", "proxy"]) {
+    for (const secondMode of ["direct", "proxy"]) {
+      for (const removed of [123, 456]) {
+        const options = new Map([[123, "/home/deck/a %command%"], [456, "/home/deck/b %command%"]]);
+        const writes = [];
+        const { changeLaunchOptions, mergeWineDllOverride } = wine({ SteamClient: { Apps: {
+          RegisterForAppDetails(id, callback) {
+            callback({ strLaunchOptions: options.get(id) });
+            return { unregister() {} };
+          },
+          SetAppLaunchOptions(id, text) { writes.push([id, text]); options.set(id, text); },
+        } } });
+        const records = new Map([[123, firstMode], [456, secondMode]].map(([id, mode]) => [id, {
+          ...record, app_id: String(id), mode, original_launch_options: options.get(id),
+          set_launch_options: mode === "proxy" ? mergeWineDllOverride(options.get(id), "version") : null,
+        }]));
+        const original = new Map(options);
+        await Promise.all([...records].map(([id, saved]) => changeLaunchOptions(id, saved, false)));
+        const survivor = removed === 123 ? 456 : 123;
+        const survivorOptions = options.get(survivor);
+        writes.length = 0;
+        const acknowledgments = [];
+        await changeLaunchOptions(removed, records.get(removed), true, async () => acknowledgments.push(removed));
+        assert.equal(options.get(removed), original.get(removed));
+        assert.equal(options.get(survivor), survivorOptions);
+        assert.ok(writes.every(([id]) => id === removed));
+        assert.deepEqual(acknowledgments, [removed]);
+        await changeLaunchOptions(survivor, records.get(survivor), true);
+        assert.deepEqual(options, original);
+      }
+    }
+  }
 });
 
 test("manual launch-option mode never reads or writes Steam options", async () => {

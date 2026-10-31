@@ -7,6 +7,7 @@ import copy
 import errno
 import json
 import os
+import posixpath
 import stat
 from pathlib import Path
 import sys
@@ -74,16 +75,27 @@ class BackendTests(unittest.TestCase):
         (self.library / f"appmanifest_{value}.acf").write_text(
             f'"AppState" {{ "appid" "{value}" "name" "Example" "installdir" "{install_dir}" }}')
 
-    def snapshot(self):
-        return {x.name: x.read_bytes() for x in self.game.iterdir() if x.is_file() and not x.is_symlink()}
+    def snapshot(self, folder=None):
+        folder = self.game if folder is None else folder
+        return {x.name: x.read_bytes() for x in folder.iterdir() if x.is_file() and not x.is_symlink()}
 
-    def tree_snapshot(self):
+    def tree_snapshot(self, folder=None):
+        folder = self.game if folder is None else folder
         result = {}
-        for path in self.game.rglob("*"):
+        for path in folder.rglob("*"):
             info = path.lstat()
             data = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
-            result[path.relative_to(self.game).as_posix()] = (info.st_mode, info.st_dev, info.st_ino, data)
+            result[path.relative_to(folder).as_posix()] = (info.st_mode, info.st_dev, info.st_ino, data)
         return result
+
+    def other_game(self):
+        other = self.game.parent / "Other"
+        other.mkdir()
+        (other / "steam_api64.dll").write_bytes(b"other original DLL")
+        (other / "unrelated.txt").write_bytes(b"other owner file")
+        self.manifest("Other", "456")
+        self.store.allow("456", True)
+        return other
 
     def install(self, mode="direct", original=""):
         return self.engine.install("123", mode, "version", [], original)
@@ -369,7 +381,7 @@ class BackendTests(unittest.TestCase):
                 with self.assertRaises((ValueError, TypeError)):
                     self.install()
                 with self.assertRaises((ValueError, TypeError)):
-                    self.store.allow("456", True)
+                    self.store.allow("123", True)
                 self.assertEqual(self.before, self.snapshot())
         (self.settings / "123.json").unlink()
         (self.settings / "allowlist.json").write_text("{}")
@@ -849,12 +861,657 @@ class BackendTests(unittest.TestCase):
         self.assertCountEqual(["installed", "refused"], results)
         self.assertEqual("installed", self.engine.status("123")[0])
 
-    def test_one_active_game_only(self):
+    def test_shared_game_folder_refused(self):
         self.install()
         self.manifest("Example", "456")
         self.store.allow("456", True)
-        with self.assertRaisesRegex(ValueError, "one game at a time"):
+        before = self.tree_snapshot()
+        journal = (self.settings / "123.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
             self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+        self.assertIsNone(self.store.load("456"))
+
+    def test_two_games_install_and_remove_independently_in_both_modes(self):
+        other = self.other_game()
+        (self.game / "steam_api.dll").unlink()
+        folders = {"123": self.game, "456": other}
+        clean = {value: self.snapshot(folder) for value, folder in folders.items()}
+        for first_mode in ("direct", "proxy"):
+            for second_mode in ("direct", "proxy"):
+                for removed, retained in (("123", "456"), ("456", "123")):
+                    with self.subTest(first_mode=first_mode, second_mode=second_mode, removed=removed):
+                        first = self.engine.install("123", first_mode, "version", ["124"], "/home/deck/a %command%")
+                        first_files = self.tree_snapshot()
+                        first_journal = (self.settings / "123.json").read_bytes()
+                        second = self.engine.install("456", second_mode, "winmm", ["457"], "/home/deck/b %command%")
+                        self.assertEqual(first_files, self.tree_snapshot())
+                        self.assertEqual(first_journal, (self.settings / "123.json").read_bytes())
+                        self.assertEqual("installed", self.engine.status("123")[0])
+                        self.assertEqual("installed", self.engine.status("456")[0])
+                        survivor = self.tree_snapshot(folders[retained])
+                        journal = (self.settings / f"{retained}.json").read_bytes()
+                        launch = {key: self.store.load(retained)[key] for key in (
+                            "original_launch_options", "set_launch_options", "launch_restore")}
+                        record, warnings = self.engine.uninstall(removed)
+                        self.assertEqual([], warnings)
+                        self.assertEqual("removed", record["phase"])
+                        self.engine.resolve_launch(removed)
+                        self.assertEqual(survivor, self.tree_snapshot(folders[retained]))
+                        self.assertEqual(journal, (self.settings / f"{retained}.json").read_bytes())
+                        self.assertEqual(launch, {key: self.store.load(retained)[key] for key in launch})
+                        self.assertEqual("installed", self.engine.status(retained)[0])
+                        self.assertEqual([], self.engine.uninstall(retained)[1])
+                        self.engine.resolve_launch(retained)
+                        for value, folder in folders.items():
+                            self.assertEqual(clean[value], self.snapshot(folder))
+                        self.assertEqual(["124"], first["enabled_dlc_ids"])
+                        self.assertEqual(["457"], second["enabled_dlc_ids"])
+
+    def test_same_app_active_phases_refuse_without_mutation(self):
+        record = self.install()
+        for phase in ("installing", "installed", "removing"):
+            with self.subTest(phase=phase):
+                record["phase"] = phase
+                self.store.save(record)
+                before = self.tree_snapshot()
+                journal = (self.settings / "123.json").read_bytes()
+                with self.assertRaisesRegex(ValueError, "this game's installation first"):
+                    self.install()
+                self.assertEqual(before, self.tree_snapshot())
+                self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+
+    def test_concurrent_different_game_installs_succeed(self):
+        other = self.other_game()
+        barrier = threading.Barrier(2)
+        def perform(value):
+            barrier.wait(timeout=5)
+            return self.engine.install(value, "direct", "version", [], "")["phase"]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            self.assertEqual(["installed", "installed"], list(pool.map(perform, ("123", "456"))))
+        for value in ("123", "456"):
+            self.assertEqual("installed", self.engine.status(value)[0])
+
+    def test_allowlisting_one_active_game_does_not_authorize_another(self):
+        other = self.other_game()
+        (self.settings / "allowlist.json").write_text('["123"]')
+        self.install()
+        before, other_before = self.tree_snapshot(), self.tree_snapshot(other)
+        with self.assertRaisesRegex(ValueError, "not on the owner allowlist"):
+            self.engine.install("456", "direct", "version", [], "")
+        with self.assertRaisesRegex(ValueError, "Confirm offline single-player"):
+            self.store.allow("456", False)
+        self.assertEqual(["123"], self.store.allowlist())
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(other_before, self.tree_snapshot(other))
+
+    def test_nested_and_containing_game_folders_refused(self):
+        self.install()
+        child = self.game / "Child"
+        child.mkdir()
+        (child / "steam_api64.dll").write_bytes(b"child original DLL")
+        self.store.allow("456", True)
+        find = steam_library.find_game
+        for folder in (child, self.game.parent):
+            with self.subTest(folder=folder), patch.object(self.engine, "find_game", side_effect=lambda value: (
+                    {"app_id": "456", "game_directory": str(folder)} if value == "456" else find(value))):
+                before = self.tree_snapshot(self.game.parent)
+                with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+                    self.engine.install("456", "direct", "version", [], "")
+                self.assertEqual(before, self.tree_snapshot(self.game.parent))
+                self.assertIsNone(self.store.load("456"))
+
+    def test_same_root_with_disjoint_api_folders_refused(self):
+        first = self.game / "First"
+        first.mkdir()
+        for name in install_state.APIS:
+            (self.game / name).rename(first / name)
+        self.install()
+        second = self.game / "Second"
+        second.mkdir()
+        (second / "steam_api64.dll").write_bytes(b"second original DLL")
+        self.manifest("Example", "456")
+        self.store.allow("456", True)
+        self.engine.launch_executables = lambda value: ["Second/game.exe"]
+        before = self.tree_snapshot()
+        with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+            self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertIsNone(self.store.load("456"))
+
+    def test_shared_file_inodes_refused_across_distinct_folders(self):
+        other = self.other_game()
+        (self.game / "steam_api.dll").unlink()
+        for mode in ("direct", "proxy"):
+            with self.subTest(mode=mode):
+                self.install(mode)
+                source = self.game / ("steam_api64_o.dll" if mode == "direct" else "steam_api64.dll")
+                target = other / "steam_api64.dll"
+                target.unlink()
+                os.link(source, target)
+                before, other_before = self.tree_snapshot(), self.tree_snapshot(other)
+                journal = (self.settings / "123.json").read_bytes()
+                with self.assertRaisesRegex(ValueError, "files overlap.*123"):
+                    self.engine.install("456", "direct", "version", [], "")
+                self.assertEqual(before, self.tree_snapshot())
+                self.assertEqual(other_before, self.tree_snapshot(other))
+                self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+                self.assertIsNone(self.store.load("456"))
+                self.assertEqual([], self.engine.uninstall("123")[1])
+                self.engine.resolve_launch("123")
+                target.unlink()
+                target.write_bytes(b"other original DLL")
+
+    def test_missing_manifest_keeps_recorded_game_root(self):
+        api = self.game / "Engine" / "Binaries"
+        api.mkdir(parents=True)
+        for name in install_state.APIS:
+            (self.game / name).rename(api / name)
+        self.install()
+        (self.library / "appmanifest_123.acf").unlink()
+        other = self.game / "ChildLibrary" / "steamapps" / "common" / "Inner"
+        other.mkdir(parents=True)
+        (other / "steam_api64.dll").write_bytes(b"other original DLL")
+        self.store.allow("456", True)
+        find = self.engine.find_game
+        before = self.tree_snapshot()
+        journal = (self.settings / "123.json").read_bytes()
+        with patch.object(self.engine, "find_game", side_effect=lambda value: (
+                {"app_id": value, "game_directory": str(other)} if value == "456" else find(value))):
+            with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+                self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+        self.assertIsNone(self.store.load("456"))
+
+    def test_game_root_is_persisted_and_schema_validated(self):
+        api = self.game / "Engine" / "Binaries"
+        api.mkdir(parents=True)
+        for name in install_state.APIS:
+            (self.game / name).rename(api / name)
+        record = self.install()
+        self.assertEqual(str(self.game), record["game_directory"])
+        self.assertEqual(str(api), record["game_dir"])
+        self.assertEqual(str(self.game), self.store.load("123")["game_directory"])
+        for bad in (None, 123, "relative", str(self.game / ".."), str(self.base / "elsewhere")):
+            with self.subTest(bad=bad):
+                altered = {**record, "game_directory": bad}
+                with self.assertRaises(ValueError):
+                    install_state.validate(altered, "123")
+
+    def legacy_install(self):
+        api = self.game / "Engine" / "Binaries"
+        api.mkdir(parents=True)
+        for name in install_state.APIS:
+            (self.game / name).rename(api / name)
+        record = self.install()
+        record.pop("game_directory", None)
+        (self.settings / "123.json").write_text(json.dumps(record))
+        return record
+
+    def test_legacy_missing_manifest_refuses_install_inside_unknown_game_root(self):
+        self.legacy_install()
+        (self.library / "appmanifest_123.acf").unlink()
+        other = self.game / "ChildLibrary" / "steamapps" / "common" / "Inner"
+        other.mkdir(parents=True)
+        (other / "steam_api64.dll").write_bytes(b"other original DLL")
+        self.store.allow("456", True)
+        find = self.engine.find_game
+        before = self.tree_snapshot()
+        journal = (self.settings / "123.json").read_bytes()
+        with patch.object(self.engine, "find_game", side_effect=lambda value: (
+                {"app_id": value, "game_directory": str(other)} if value == "456" else find(value))):
+            with self.assertRaisesRegex(ValueError, "Cannot confirm the folder of app 123"):
+                self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+        self.assertIsNone(self.store.load("456"))
+
+    def test_legacy_present_manifest_migrates_before_nested_install_refusal(self):
+        original = self.legacy_install()
+        other = self.game / "ChildLibrary" / "steamapps" / "common" / "Inner"
+        other.mkdir(parents=True)
+        (other / "steam_api64.dll").write_bytes(b"other original DLL")
+        self.store.allow("456", True)
+        find = self.engine.find_game
+        before = self.tree_snapshot()
+        with patch.object(self.engine, "find_game", side_effect=lambda value: (
+                {"app_id": value, "game_directory": str(other)} if value == "456" else find(value))):
+            with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+                self.engine.install("456", "direct", "version", [], "")
+        migrated = json.loads((self.settings / "123.json").read_text())
+        self.assertEqual({**original, "game_directory": str(self.game)}, migrated)
+        self.assertEqual(migrated, install_state.validate(migrated, "123"))
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertIsNone(self.store.load("456"))
+
+    def test_legacy_present_manifest_does_not_block_unrelated_install(self):
+        original = self.legacy_install()
+        other = self.other_game()
+        self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual("installed", self.engine.status("456")[0])
+        self.assertTrue((other / install_state.CONFIG).exists())
+        self.assertEqual({**original, "game_directory": str(self.game)}, self.store.load("123"))
+
+    def test_legacy_active_reads_migrate_only_root_and_removed_reads_do_not_write(self):
+        original = self.legacy_install()
+        for phase in ("installing", "installed", "removing", "removed"):
+            with self.subTest(phase=phase):
+                legacy = {**original, "phase": phase}
+                (self.settings / "123.json").write_text(json.dumps(legacy))
+                before = (self.settings / "123.json").read_bytes()
+                with patch.object(self.store, "_replace", wraps=self.store._replace) as save:
+                    loaded = self.store.load("123")
+                if phase == "removed":
+                    save.assert_not_called()
+                    self.assertEqual(before, (self.settings / "123.json").read_bytes())
+                    self.assertEqual(legacy, loaded)
+                else:
+                    expected = {**legacy, "game_directory": str(self.game)}
+                    save.assert_called_once_with(expected)
+                    self.assertEqual(expected, loaded)
+                    self.assertEqual(expected, json.loads((self.settings / "123.json").read_text()))
+                    self.assertEqual(expected, install_state.validate(loaded, "123"))
+
+    def test_legacy_status_migrates_root(self):
+        original = self.legacy_install()
+        status, migrated = self.engine.status("123")
+        self.assertEqual("installed", status)
+        self.assertEqual({**original, "game_directory": str(self.game)}, migrated)
+        self.assertEqual(migrated, json.loads((self.settings / "123.json").read_text()))
+
+    def test_legacy_migration_does_not_persist_validation_defaults(self):
+        original = self.legacy_install()
+        for name in ("quarantine", "launch_restore", "foreign_proxies"):
+            original.pop(name)
+        (self.settings / "123.json").write_text(json.dumps(original))
+        migrated = self.store.load("123")
+        persisted = json.loads((self.settings / "123.json").read_text())
+        self.assertEqual({**original, "game_directory": str(self.game)}, persisted)
+        self.assertEqual(install_state.validate(persisted, "123"), migrated)
+
+    def test_legacy_removed_journal_does_not_block_install_or_migrate(self):
+        self.install()
+        removed, warnings = self.engine.uninstall("123")
+        self.assertEqual([], warnings)
+        removed.pop("game_directory")
+        (self.settings / "123.json").write_text(json.dumps(removed))
+        journal = (self.settings / "123.json").read_bytes()
+        self.other_game()
+        self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual("installed", self.engine.status("456")[0])
+        self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+
+    def test_legacy_migrated_root_survives_manifest_loss(self):
+        original = self.legacy_install()
+        self.assertEqual({**original, "game_directory": str(self.game)}, self.store.load("123"))
+        (self.library / "appmanifest_123.acf").unlink()
+        other = self.game / "ChildLibrary" / "steamapps" / "common" / "Inner"
+        other.mkdir(parents=True)
+        (other / "steam_api64.dll").write_bytes(b"other original DLL")
+        self.store.allow("456", True)
+        find = self.engine.find_game
+        journal = (self.settings / "123.json").read_bytes()
+        before = self.tree_snapshot()
+        with patch.object(self.engine, "find_game", side_effect=lambda value: (
+                {"app_id": value, "game_directory": str(other)} if value == "456" else find(value))):
+            with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+                self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+
+    def test_legacy_unknown_root_refuses_unrelated_install_without_mutation(self):
+        original = self.legacy_install()
+        other = self.other_game()
+        for failure in (ValueError("missing manifest"), PermissionError("unreadable manifest"),
+                        {"game_directory": str(other)}):
+            with self.subTest(failure=failure):
+                (self.settings / "123.json").write_text(json.dumps(original))
+                before = self.tree_snapshot(self.game.parent)
+                journal = (self.settings / "123.json").read_bytes()
+                find = steam_library.find_game
+                def lookup(value, **kwargs):
+                    if value != "123":
+                        return find(value, **kwargs)
+                    if isinstance(failure, Exception):
+                        raise failure
+                    return failure
+                with patch.object(steam_library, "find_game", side_effect=lookup), patch.object(
+                        self.engine, "find_game", side_effect=lookup):
+                    self.assertEqual(original, self.store.load("123"))
+                    with self.assertRaisesRegex(ValueError, "Cannot confirm the folder of app 123"):
+                        self.engine.install("456", "direct", "version", [], "")
+                self.assertEqual(before, self.tree_snapshot(self.game.parent))
+                self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+                self.assertIsNone(self.store.load("456"))
+
+    def test_legacy_migration_write_failure_keeps_load_and_status_available(self):
+        original = self.legacy_install()
+        journal = (self.settings / "123.json").read_bytes()
+        before = self.tree_snapshot()
+        for error in (OSError("replace failed"), ValueError("replace refused")):
+            with self.subTest(error=error), patch.object(TestDirectory, "atomic_json", side_effect=error):
+                self.assertEqual(original, self.store.load("123"))
+                self.assertEqual(("installed", original), self.engine.status("123"))
+                self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+                self.assertEqual(before, self.tree_snapshot())
+
+    def test_legacy_migration_write_failure_allows_uninstall_and_recovery(self):
+        original = self.legacy_install()
+        api = Path(original["game_dir"])
+        installed = self.snapshot(api)
+        replace = self.store._replace
+        for phase in ("installed", "installing", "removing"):
+            for error in (OSError("replace failed"), ValueError("replace refused")):
+                with self.subTest(phase=phase, error=error):
+                    for name, data in installed.items():
+                        (api / name).write_bytes(data)
+                    legacy = {**original, "phase": phase}
+                    (self.settings / "123.json").write_text(json.dumps(legacy))
+                    def fail_migration(record):
+                        if "game_directory" in record:
+                            raise error
+                        return replace(record)
+                    with patch.object(self.store, "_replace", side_effect=fail_migration):
+                        removed, warnings = self.engine.uninstall("123")
+                    self.assertEqual([], warnings)
+                    self.assertEqual("removed", removed["phase"])
+                    self.assertNotIn("game_directory", removed)
+                    self.assertEqual(removed, self.store.load("123"))
+                    self.assertEqual(self.before, {**self.snapshot(), **self.snapshot(api)})
+
+    def test_legacy_migration_write_failure_refuses_other_install(self):
+        original = self.legacy_install()
+        self.other_game()
+        journal = (self.settings / "123.json").read_bytes()
+        before = self.tree_snapshot(self.game.parent)
+        for error in (OSError("replace failed"), ValueError("replace refused")):
+            with self.subTest(error=error), patch.object(TestDirectory, "atomic_json", side_effect=error):
+                self.assertEqual(original, self.store.load("123"))
+                with self.assertRaisesRegex(ValueError, "Cannot confirm the folder of app 123"):
+                    self.engine.install("456", "direct", "version", [], "")
+                self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+                self.assertEqual(before, self.tree_snapshot(self.game.parent))
+                self.assertIsNone(self.store.load("456"))
+
+    def test_legacy_duplicate_manifests_never_migrate_narrower_root(self):
+        nested_library = self.game / "ChildLibrary" / "steamapps"
+        nested = nested_library / "common" / "Inner"
+        api = nested / "Engine" / "Binaries"
+        api.mkdir(parents=True)
+        for name in install_state.APIS:
+            (self.game / name).rename(api / name)
+        original = self.install()
+        original.pop("game_directory")
+        (self.settings / "123.json").write_text(json.dumps(original))
+        duplicate = nested_library / "appmanifest_123.acf"
+        duplicate.write_text('"AppState" { "appid" "123" "installdir" "Inner" }')
+        other = self.game / "OtherBranch"
+        other.mkdir()
+        (other / "steam_api64.dll").write_bytes(b"other original DLL")
+        self.store.allow("456", True)
+        journal = (self.settings / "123.json").read_bytes()
+        before = self.tree_snapshot()
+        find = self.engine.find_game
+        with patch.object(steam_library, "library_folders", return_value=[str(nested_library), str(self.library)]), patch.object(
+                self.engine, "find_game", side_effect=lambda value: (
+                    {"app_id": value, "game_directory": str(other)} if value == "456" else find(value))):
+            self.assertEqual(original, self.store.load("123"))
+            with self.assertRaisesRegex(ValueError, "Cannot confirm the folder of app 123"):
+                self.engine.install("456", "direct", "version", [], "")
+            self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+            self.assertEqual(before, self.tree_snapshot())
+            self.assertIsNone(self.store.load("456"))
+            duplicate.unlink()
+            (self.library / "appmanifest_123.acf").unlink()
+            before = self.tree_snapshot()
+            with self.assertRaisesRegex(ValueError, "Cannot confirm the folder of app 123"):
+                self.engine.install("456", "direct", "version", [], "")
+            self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+            self.assertEqual(before, self.tree_snapshot())
+            self.assertIsNone(self.store.load("456"))
+
+    def test_legacy_journal_missing_manifest_still_loads(self):
+        original = self.legacy_install()
+        (self.library / "appmanifest_123.acf").unlink()
+        legacy = self.store.load("123")
+        self.assertEqual(original, legacy)
+        with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+            self.engine._check_folders({"game_directory": os.path.join(legacy["game_dir"], "Child")}, [legacy])
+
+    def test_legacy_uninstall_and_recovery_preserve_missing_manifest_safety(self):
+        original = self.legacy_install()
+        installed = self.tree_snapshot()
+        for phase in ("installed", "installing", "removing"):
+            with self.subTest(phase=phase):
+                legacy = {**original, "phase": phase}
+                (self.settings / "123.json").write_text(json.dumps(legacy))
+                (self.library / "appmanifest_123.acf").unlink()
+                journal = (self.settings / "123.json").read_bytes()
+                with self.assertRaisesRegex(ValueError, "Installed Steam game not found"):
+                    self.engine.uninstall("123")
+                self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+                self.assertEqual(installed, self.tree_snapshot())
+                self.manifest("Example")
+        record, warnings = self.engine.uninstall("123")
+        self.assertEqual([], warnings)
+        self.assertEqual("removed", record["phase"])
+        self.assertEqual(str(self.game), record["game_directory"])
+        self.assertEqual(self.before, {**self.snapshot(), **self.snapshot(Path(original["game_dir"]))})
+
+    def test_legacy_unknown_root_does_not_block_other_game_uninstall_or_recovery(self):
+        legacy = self.legacy_install()
+        other = self.other_game()
+        clean = self.snapshot(other)
+        record = self.engine.install("456", "proxy", "winmm", [], "")
+        (self.settings / "123.json").write_text(json.dumps(legacy))
+        (self.library / "appmanifest_123.acf").unlink()
+        journal = (self.settings / "123.json").read_bytes()
+        before = self.tree_snapshot()
+        for phase in ("installed", "installing", "removing"):
+            with self.subTest(phase=phase):
+                record["phase"] = phase
+                self.store.save(record)
+                result, warnings = self.engine.uninstall("456")
+                self.assertEqual([], warnings)
+                self.assertEqual("removed", result["phase"])
+                self.engine.resolve_launch("456")
+                self.assertEqual(clean, self.snapshot(other))
+                self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+                self.assertEqual(before, self.tree_snapshot())
+
+    def test_symlink_modeled_game_aliases_and_physical_ancestry_refused(self):
+        api = self.game / "First"
+        api.mkdir()
+        for name in install_state.APIS:
+            (self.game / name).rename(api / name)
+        record = self.install()
+        (self.game / "Second").mkdir()
+        (self.game / "Second" / "steam_api64.dll").write_bytes(b"second original DLL")
+        alias = self.base / "Alias"
+        alias.symlink_to(self.game, target_is_directory=True)
+        child_alias = self.base / "ChildAlias"
+        child_alias.symlink_to(self.game / "Second", target_is_directory=True)
+        parent_alias = self.base / "ParentAlias"
+        parent_alias.symlink_to(self.game.parent, target_is_directory=True)
+        before = self.tree_snapshot()
+        # Model mount aliases only for the read-only guard. Mutation still rejects symlinks.
+        with patch.object(smokeapi, "Directory", side_effect=lambda path: TestDirectory(os.path.realpath(path))):
+            for candidate in (alias, child_alias, parent_alias):
+                with self.subTest(candidate=candidate.name):
+                    with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+                        self.engine._check_folders({"game_directory": str(candidate)}, [record])
+        self.assertEqual(before, self.tree_snapshot())
+
+    def test_case_insensitive_game_root_alias_with_disjoint_api_folders_refused(self):
+        api = self.game / "First"
+        api.mkdir()
+        for name in install_state.APIS:
+            (self.game / name).rename(api / name)
+        record = self.install()
+        (self.game / "Second").mkdir()
+        (self.game / "Second" / "steam_api64.dll").write_bytes(b"second original DLL")
+        alias = str(self.game.parent / "eXAMPLE")
+        def directory(path):
+            if path == alias or path.startswith(alias + os.sep):
+                path = str(self.game) + path[len(alias):]
+            return TestDirectory(path)
+        def lexical(first, second):
+            first, second = (path.replace("\\", "/") for path in (first, second))
+            return posixpath.commonpath([first, second]) in (first, second)
+        before = self.tree_snapshot()
+        with patch.object(smokeapi, "Directory", side_effect=directory), patch.object(
+                smokeapi, "folders_overlap", side_effect=lexical):
+            with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+                self.engine._check_folders({"game_directory": alias}, [record])
+        self.assertEqual(before, self.tree_snapshot())
+
+    def test_physical_api_folder_aliases_and_ancestry_refused(self):
+        api = self.game / "Engine" / "Binaries"
+        api.mkdir(parents=True)
+        for name in install_state.APIS:
+            (self.game / name).rename(api / name)
+        record = self.install()
+        other = self.other_game()
+        before, other_before = self.tree_snapshot(), self.tree_snapshot(other)
+        alias = other / "Plugins"
+        # Model a bind-mounted API folder while keeping the game roots distinct.
+        def directory(path):
+            return TestDirectory(str(api) if path == str(alias) else path)
+        with patch.object(smokeapi, "Directory", side_effect=directory):
+            self.engine._check_folders({"game_directory": str(other)}, [record])
+            with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+                self.engine._check_folders({"game_directory": str(other)}, [record], str(alias))
+        for destination in (other, other / "Child"):
+            destination.mkdir(exist_ok=True)
+            def directory(path):
+                return TestDirectory(str(destination) if path == str(api) else path)
+            with self.subTest(destination=destination.name), patch.object(
+                    smokeapi, "Directory", side_effect=directory):
+                with self.assertRaisesRegex(ValueError, "folder overlaps.*123"):
+                    self.engine._check_folders({"game_directory": str(other)}, [record])
+        (other / "Child").rmdir()
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(other_before, self.tree_snapshot(other))
+
+    def test_case_variant_recorded_backup_shared_inode_refused(self):
+        other = self.other_game()
+        self.install()
+        backup = self.game / "STEAM_API64_O.DLL"
+        (self.game / "steam_api64_o.dll").rename(backup)
+        target = other / "steam_api64.dll"
+        target.unlink()
+        os.link(backup, target)
+        before, other_before = self.tree_snapshot(), self.tree_snapshot(other)
+        journal = (self.settings / "123.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "files overlap.*123"):
+            self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(other_before, self.tree_snapshot(other))
+        self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+        self.assertIsNone(self.store.load("456"))
+
+    def test_interrupted_install_recovers_while_other_game_stays_active(self):
+        other = self.other_game()
+        (self.game / "steam_api.dll").unlink()
+        self.engine.install("456", "proxy", "winmm", ["457"], "/home/deck/b %command%")
+        before, journal = self.tree_snapshot(other), (self.settings / "456.json").read_bytes()
+        clean = self.snapshot()
+        rename = TestDirectory.rename
+        for mode in ("direct", "proxy"):
+            count = 0
+            def crash(directory, *args):
+                nonlocal count
+                count += 1
+                if count == 2:
+                    raise OSError("simulated interrupted commit")
+                return rename(directory, *args)
+            with self.subTest(mode=mode):
+                with patch.object(TestDirectory, "rename", crash), patch.object(
+                        self.engine, "_remove", side_effect=OSError("simulated process exit before rollback")):
+                    with self.assertRaisesRegex(OSError, "simulated process exit"):
+                        self.install(mode, "/home/deck/a %command%")
+                restarted = smokeapi.Installer(install_state.Store(str(self.settings)), steam_library.find_game)
+                self.assertIn("interrupted", restarted.status("123")[0])
+                self.assertEqual("installed", restarted.status("456")[0])
+                record, warnings = restarted.uninstall("123")
+                self.assertEqual([], warnings)
+                self.assertEqual("removed", record["phase"])
+                restarted.resolve_launch("123", manual=True)
+                self.assertEqual(clean, self.snapshot())
+                self.assertEqual(before, self.tree_snapshot(other))
+                self.assertEqual(journal, (self.settings / "456.json").read_bytes())
+
+    def test_other_game_pending_launch_restore_does_not_block_install(self):
+        other = self.other_game()
+        (self.game / "steam_api.dll").unlink()
+        for mode in ("direct", "proxy"):
+            with self.subTest(mode=mode):
+                self.install("proxy", "/home/deck/a %command%")
+                config = (self.game / install_state.CONFIG).read_bytes()
+                (self.game / install_state.CONFIG).write_bytes(b"owner config")
+                record, warnings = self.engine.uninstall("123")
+                self.assertTrue(warnings)
+                self.assertEqual("removing", record["phase"])
+                self.assertEqual("pending", record["launch_restore"])
+                before, journal = self.tree_snapshot(), (self.settings / "123.json").read_bytes()
+                self.engine.install("456", mode, "winmm", [], "/home/deck/b %command%")
+                self.assertEqual("installed", self.engine.status("456")[0])
+                self.assertEqual([], self.engine.uninstall("456")[1])
+                self.engine.resolve_launch("456")
+                self.assertEqual(before, self.tree_snapshot())
+                self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+                (self.game / install_state.CONFIG).write_bytes(config)
+                self.assertEqual([], self.engine.uninstall("123")[1])
+                self.assertEqual("pending", self.store.load("123")["launch_restore"])
+                self.engine.install("456", mode, "winmm", [], "")
+                self.assertEqual([], self.engine.uninstall("456")[1])
+                self.engine.resolve_launch("456")
+                self.engine.resolve_launch("123")
+
+    def test_unrelated_malformed_journal_does_not_block_scoped_operations(self):
+        other = self.other_game()
+        self.engine.install("456", "proxy", "winmm", [], "")
+        (self.settings / "123.json").write_bytes(b"{invalid")
+        before = self.tree_snapshot()
+        self.store.allow("456", True)
+        self.assertEqual("installed", self.engine.status("456")[0])
+        self.assertEqual([], self.engine.uninstall("456")[1])
+        self.engine.resolve_launch("456")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(b"{invalid", (self.settings / "123.json").read_bytes())
+        with self.assertRaises(ValueError):
+            self.engine.install("456", "direct", "version", [], "")
+
+    def test_missing_other_manifest_does_not_block_independent_install(self):
+        other = self.other_game()
+        self.install()
+        (self.library / "appmanifest_123.acf").unlink()
+        before, journal = self.tree_snapshot(), (self.settings / "123.json").read_bytes()
+        self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual("installed", self.engine.status("456")[0])
+        self.assertEqual([], self.engine.uninstall("456")[1])
+        self.engine.resolve_launch("456")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+
+    def test_interrupted_settings_write_preserved_during_other_game_recovery(self):
+        other = self.other_game()
+        self.install()
+        self.engine.install("456", "proxy", "winmm", [], "")
+        before, journal = self.tree_snapshot(), (self.settings / "123.json").read_bytes()
+        stage = self.settings / (".cdh-" + "a" * 32)
+        stage.write_bytes(b"interrupted settings write")
+        self.assertEqual("installed", self.engine.status("456")[0])
+        self.assertEqual([], self.engine.uninstall("456")[1])
+        self.engine.resolve_launch("456")
+        self.store.allow("456", True)
+        with self.assertRaisesRegex(ValueError, "Interrupted settings write"):
+            self.engine.install("456", "direct", "version", [], "")
+        self.assertEqual(before, self.tree_snapshot())
+        self.assertEqual(journal, (self.settings / "123.json").read_bytes())
+        self.assertEqual(b"interrupted settings write", stage.read_bytes())
 
     def test_complex_launch_options_refused(self):
         for original in ("WINEDLLOVERRIDES='version=b' %command%", "echo hi; %command%", '"/path with spaces" %command%'):

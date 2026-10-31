@@ -4,6 +4,7 @@ import functools
 import os
 import re
 import threading
+import steam_library
 from safe_fs import Directory, app_id, component
 
 LOCK = threading.RLock()
@@ -13,6 +14,7 @@ CONFIG = "SmokeAPI.config.json"
 FIELDS = {"schema", "app_id", "game_dir", "mode", "proxy_name", "originals", "installed",
           "created", "stages", "phase", "original_launch_options", "set_launch_options", "enabled_dlc_ids",
           "quarantine", "launch_restore", "foreign_proxies"}
+OPTIONAL_FIELDS = {"game_directory"}
 
 
 def locked(function):
@@ -33,23 +35,29 @@ def launch_options(original, proxy):
 
 def validate(record, value):
     app_id(value)
-    if isinstance(record, dict) and set(record) in (FIELDS - {"quarantine", "launch_restore", "foreign_proxies"},
+    if isinstance(record, dict) and set(record) - OPTIONAL_FIELDS in (FIELDS - {"quarantine", "launch_restore", "foreign_proxies"},
                                                    FIELDS - {"quarantine", "launch_restore"}):
         record = {**record, "quarantine": {}, "launch_restore": (
             "pending" if record["mode"] == "proxy" and record["phase"] in ("removing", "removed")
             else "acknowledged")}
-    if isinstance(record, dict) and set(record) == FIELDS - {"foreign_proxies"}:
+    if isinstance(record, dict) and set(record) - OPTIONAL_FIELDS == FIELDS - {"foreign_proxies"}:
         record = {**record, "foreign_proxies": {}}
-    if not isinstance(record, dict) or set(record) != FIELDS:
+    if not isinstance(record, dict) or set(record) - OPTIONAL_FIELDS != FIELDS:
         raise ValueError("Malformed install record. Refusing mutation")
     if (type(record["schema"]) is not int or record["schema"] != 1 or record["app_id"] != value
             or record["mode"] not in ("direct", "proxy")
             or record["proxy_name"] not in PROXIES
             or record["phase"] not in ("installing", "installed", "removing", "removed")):
         raise ValueError("Invalid install record")
-    path = record["game_dir"]
-    if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
-        raise ValueError("Invalid recorded game directory")
+    for key in ("game_dir", "game_directory"):
+        if key not in record:
+            continue
+        path = record[key]
+        if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+            raise ValueError("Invalid recorded game directory")
+    if ("game_directory" in record
+            and os.path.commonpath([record["game_directory"], record["game_dir"]]) != record["game_directory"]):
+        raise ValueError("Recorded API directory is outside the game directory")
     for key in ("originals", "installed"):
         hashes = record[key]
         if not isinstance(hashes, dict) or not hashes:
@@ -144,7 +152,24 @@ class Store:
             name = value + ".json"
             if not directory.exists(name):
                 return None
-            return validate(json.loads(directory.read(name, 128 * 1024)), value)
+            original = json.loads(directory.read(name, 128 * 1024))
+        record = validate(original, value)
+        if record["phase"] != "removed" and "game_directory" not in record:
+            try:
+                game = steam_library.find_game(value, unique=True)
+                root = game["game_directory"] if steam_library.inside_game(game, record) else None
+            except (ValueError, OSError):
+                root = None
+            if root is not None:
+                # Preserve legacy fields exactly; validation may supply defaults in memory.
+                try:
+                    self._replace({**original, "game_directory": root})
+                except (OSError, ValueError):
+                    # Optional migration cannot prevent access to a valid legacy record.
+                    pass
+                else:
+                    record = {**record, "game_directory": root}
+        return record
 
     @locked
     def all(self):
@@ -161,6 +186,11 @@ class Store:
     @locked
     def save(self, record):
         record = validate(record, record["app_id"])
+        self._replace(record)
+
+    @locked
+    def _replace(self, record):
+        validate(record, record["app_id"])
         with Directory(self.path) as directory:
             directory.atomic_json(record["app_id"] + ".json", json.dumps(record, sort_keys=True).encode())
 
@@ -179,7 +209,7 @@ class Store:
         if confirmed is not True:
             raise ValueError("Confirm offline single-player with no anti-cheat")
         with LOCK:
-            self.all()
+            self.load(value)
             values = sorted(set(self.allowlist()) | {value})
             with Directory(self.path) as directory:
                 directory.atomic_json("allowlist.json", json.dumps(values).encode())

@@ -99,7 +99,7 @@ function CreamDeckPage({ appId }: { appId: string }) {
       })}>{page.allowed ? "Game is allowlisted" : "Add this game to owner allowlist"}</ButtonItem></PanelSectionRow>
     </PanelSection>
     <PanelSection title="SmokeAPI">
-      <p>Close the game first. One recorded game at a time. DLC files must already be installed.</p>
+      <p>Close the game first. DLC files must already be installed.</p>
       <PanelSectionRow><Dropdown selectedOption={mode} rgOptions={[{ label: "Direct", data: "direct" }, { label: "Proxy", data: "proxy" }]} onChange={(x) => setMode(x.data)} /></PanelSectionRow>
       {mode === "proxy" && <PanelSectionRow><Dropdown selectedOption={proxy} rgOptions={(page.available_proxies || []).map((x) => ({ label: x, data: x }))} onChange={(x) => setProxy(x.data)} /></PanelSectionRow>}
       {mode === "proxy" && !page.available_proxies?.length && <p>No free supported proxy name in the game's top folder. Use direct mode.</p>}

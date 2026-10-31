@@ -1,4 +1,4 @@
-"""One-game SmokeAPI transactions with a durable settings journal."""
+"""Per-game SmokeAPI transactions with durable settings journals."""
 from __future__ import annotations
 
 import fnmatch
@@ -12,7 +12,7 @@ from contextlib import ExitStack
 from safe_fs import Directory, app_id, digest
 from install_state import APIS, CONFIG, LOCK, PROXIES, launch_options
 from resource_files import verified_resources
-from steam_library import assert_game_idle, relative_executable
+from steam_library import assert_game_idle, inside_game, relative_executable
 
 CHANGED = "game changed since install, run Verify integrity in Steam"
 SCAN_DEPTH = 16
@@ -137,9 +137,37 @@ def available_proxies(root):
         return []
 
 
-def inside_game(game, record):
-    root = game["game_directory"]
-    return os.path.commonpath([root, record["game_dir"]]) == root
+def folders_overlap(first, second):
+    first, second = os.path.normcase(first), os.path.normcase(second)
+    try:
+        return os.path.commonpath([first, second]) in (first, second)
+    except ValueError:
+        return False
+
+
+def recorded_names(record):
+    return (set(record["originals"]) | set(record["installed"]) | set(record["created"])
+            | set(record["stages"].values()) | set(record["foreign_proxies"]))
+
+
+def folder_identities(paths):
+    endpoints, ancestors = set(), set()
+    for path in set(paths):
+        try:
+            directory = Directory(path)
+        except FileNotFoundError:
+            continue
+        with ExitStack() as stack:
+            stack.enter_context(directory)
+            identity = directory.identity()
+            endpoints.add(identity)
+            seen = set()
+            while identity not in seen:
+                seen.add(identity)
+                ancestors.add(identity)
+                directory = stack.enter_context(directory.parent())
+                identity = directory.identity()
+    return endpoints, ancestors
 
 
 class Installer:
@@ -148,14 +176,66 @@ class Installer:
         self.find_game = find_game
         self.launch_executables = launch_executables or (lambda value: ())
 
+    def _check_folders(self, game, records, api_path=None):
+        if not records:
+            return
+        candidates = [game["game_directory"]] + ([api_path] if api_path else [])
+        identities, ancestors = folder_identities(candidates)
+        for record in records:
+            roots = [record["game_dir"]]
+            if "game_directory" in record:
+                roots.append(record["game_directory"])
+            try:
+                other = self.find_game(record["app_id"])
+                if inside_game(other, record):
+                    roots.append(other["game_directory"])
+            except (ValueError, OSError):
+                # A missing manifest cannot release the recorded files.
+                pass
+            if any(folders_overlap(candidate, root) for candidate in candidates for root in roots):
+                raise ValueError(f"Game folder overlaps the active installation for app {record['app_id']}")
+            saved, saved_ancestors = folder_identities(roots)
+            if identities & saved_ancestors or saved & ancestors:
+                raise ValueError(f"Game folder overlaps the active installation for app {record['app_id']}")
+
+    def _check_shared_files(self, directory, records):
+        names = {*APIS, CONFIG, *(x.replace(".dll", "_o.dll") for x in APIS),
+                 *(x + ".dll" for x in PROXIES)}
+        names = {name.casefold() for name in names}
+        files = {(info.st_dev, info.st_ino) for name, info in directory.entries()
+                 if name.casefold() in names and stat.S_ISREG(info.st_mode)}
+        for record in records:
+            try:
+                saved = Directory(record["game_dir"])
+            except FileNotFoundError:
+                continue
+            with saved:
+                owned = {name.casefold() for name in recorded_names(record)}
+                shared = saved.identity() == directory.identity()
+                shared |= any((info.st_dev, info.st_ino) in files for name, info in saved.entries()
+                              if name.casefold() in owned and stat.S_ISREG(info.st_mode))
+                for name in record["quarantine"]:
+                    try:
+                        capture = saved.child(name)
+                    except FileNotFoundError:
+                        continue
+                    with capture:
+                        shared |= any((info.st_dev, info.st_ino) in files for _, info in capture.entries()
+                                      if stat.S_ISREG(info.st_mode))
+                if shared:
+                    raise ValueError(f"Game files overlap the active installation for app {record['app_id']}")
+
     def install(self, value, mode, proxy, enabled, original_launch, manual_launch=False):
         with LOCK:
             value = app_id(value)
             records = self.store.all()
             if any(r["app_id"] == value and r["mode"] == "proxy" and r["launch_restore"] == "pending" for r in records):
                 raise ValueError("Launch options restoration is pending. Restore them or explicitly resolve by hand first")
-            if any(r["phase"] != "removed" for r in records):
-                raise ValueError("Remove or recover the recorded installation first. Only one game at a time")
+            if any(r["app_id"] == value and r["phase"] != "removed" for r in records):
+                raise ValueError("Remove or recover this game's installation first")
+            for record in records:
+                if record["phase"] != "removed" and "game_directory" not in record:
+                    raise ValueError(f"Cannot confirm the folder of app {record['app_id']}. Reinstall or remove it first")
             if value not in self.store.allowlist():
                 raise ValueError("Game is not on the owner allowlist")
             if mode not in ("direct", "proxy") or proxy not in PROXIES:
@@ -173,6 +253,8 @@ class Installer:
                 desired = None
             game = self.find_game(value)
             assert_game_idle(game)
+            active = [record for record in records if record["phase"] != "removed"]
+            self._check_folders(game, active)
             resources = verified_resources()
             with Directory(game["game_directory"]) as root:
                 anti_cheat(root)
@@ -180,6 +262,8 @@ class Installer:
             if mode == "proxy" and path != game["game_directory"]:
                 raise ValueError("Proxy mode needs the Steam API DLL in the game's top folder. Use direct mode")
             with Directory(path) as directory:
+                self._check_folders(game, active, path)
+                self._check_shared_files(directory, active)
                 originals = {name: directory.hash(name) for name in APIS if directory.exists(name)}
                 if not originals:
                     raise ValueError("No supported Windows Steam API DLL found in the game folder")
@@ -207,6 +291,7 @@ class Installer:
                     payload[proxy + ".dll"] = resources[next(iter(originals))]
                     created = list(payload)
                 record = {"schema": 1, "app_id": value, "game_dir": path,
+                          "game_directory": game["game_directory"],
                           "mode": mode, "proxy_name": proxy, "originals": originals,
                           "installed": {name: digest(data) for name, data in payload.items()},
                           "created": created, "stages": {name: ".cdh-" + uuid.uuid4().hex for name in payload},
@@ -236,7 +321,6 @@ class Installer:
 
     def status(self, value):
         with LOCK:
-            self.store.all()
             record = self.store.load(app_id(value))
             if not record or record["phase"] == "removed":
                 return "not installed", record
@@ -257,7 +341,6 @@ class Installer:
 
     def uninstall(self, value):
         with LOCK:
-            self.store.all()
             record = self.store.load(app_id(value))
             if not record:
                 raise ValueError("No valid install record. No files were removed")
@@ -273,7 +356,6 @@ class Installer:
 
     def resolve_launch(self, value, manual=False):
         with LOCK:
-            self.store.all()
             record = self.store.load(app_id(value))
             if not record or record["phase"] not in ("removing", "removed"):
                 raise ValueError("Remove game files before resolving launch restoration")

@@ -1,7 +1,7 @@
 {
   "name": "creamdeck-hardened",
   "version": "1.0.2",
-  "description": "CreamDeck Hardened: SmokeAPI only, unprivileged, one offline Proton game at a time.",
+  "description": "CreamDeck Hardened: SmokeAPI only, unprivileged, per-game offline Proton installs.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",

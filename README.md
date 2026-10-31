@@ -1,6 +1,6 @@
 # CreamDeck Hardened
 
-A SmokeAPI-only Decky plugin for one owner-approved offline Proton game at a time, intended for a Legion Go 2 running SteamOS.
+A SmokeAPI-only Decky plugin for owner-approved offline Proton games, managed independently per game, intended for a Legion Go 2 running SteamOS.
 
 This fork keeps the GPL-3.0 license and credits Qiming-Liu's [upstream CreamDeck](https://github.com/Qiming-Liu/CreamDeck), based on commit `242a6147`.
 CreamInstaller by FroggMaster supplied the upstream install approach. SmokeAPI is by acidicoala. The library-menu patch derives from CheatDeck and decky-steamgriddb.
@@ -23,7 +23,8 @@ The opaque DLLs' network behavior, configuration compatibility and credential ac
 The allowlist starts empty. The owner must confirm that the current game is offline single-player with no anti-cheat, then choose **Add this game to owner allowlist**.
 Never add an online game, including one that offers an offline mode. A marker scan cannot establish that a game is safe.
 The backend independently requires this allowlist and rejects EAC/BattlEye markers down to 16 folders deep, ignoring case. It refuses if deeper folders prevent a complete scan.
-Only one active or unresolved install record is permitted across all games. Remove or manually recover that installation before installing another.
+Several games can have active installs. Each game has its own journal and launch options. Remove or recover that game's previous installation before reinstalling it. Active installs cannot share files or overlapping game folders.
+New installs still require valid journals and no interrupted settings write so file conflicts can be checked. Status and recovery use only the selected game's journal.
 
 ## Install the reviewed ZIP
 

@@ -37,6 +37,7 @@ export function mergeWineDllOverride(original: string, proxy: string): string {
 
 export async function changeLaunchOptions(appId: number, record: InstallRecord, restore: boolean,
   acknowledge?: () => Promise<void>): Promise<string> {
+  if (record.app_id !== String(appId)) throw new Error("Install record belongs to a different game");
   if (record.mode !== "proxy") {
     if (restore) await acknowledge?.();
     return "";

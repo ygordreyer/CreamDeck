@@ -90,6 +90,12 @@ class Directory:
         child.fd = os.open(component(name), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
         return child
 
+    def parent(self):
+        # Ancestry checks must follow the opened directory, not a path alias.
+        parent = object.__new__(Directory)
+        parent.fd = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
+        return parent
+
     def ensure_child_dir(self, name):
         component(name)
         try:

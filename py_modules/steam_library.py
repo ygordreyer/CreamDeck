@@ -117,13 +117,16 @@ def confined_game(library, install_dir):
     return path
 
 
-def find_game(value):
+def find_game(value, *, unique=False):
     value = app_id(value)
+    found = None
     for library in library_folders():
         with Directory(library) as directory:
             name = f"appmanifest_{value}.acf"
             if not directory.exists(name):
                 continue
+            if found is not None:
+                raise ValueError("Several Steam manifests found for app " + value)
             data = get_child(parse(directory.read(name).decode("utf-8")), "AppState")
         if not isinstance(data, dict) or get_child(data, "appid") != value:
             raise ValueError("Manifest app ID mismatch")
@@ -133,11 +136,20 @@ def find_game(value):
         updating = bool(int(flags) & UPDATE_RUNNING_FLAGS) if flags is not None else False
         if flags is not None and not int(flags) & 4 and not updating:
             raise ValueError("Steam game is not installed")
-        return {"app_id": value, "name": get_child(data, "name") or value,
-                "game_directory": confined_game(library, get_child(data, "installdir")),
-                "updating": updating,
-                "update_state_checked": flags is not None}
+        found = {"app_id": value, "name": get_child(data, "name") or value,
+                 "game_directory": confined_game(library, get_child(data, "installdir")),
+                 "updating": updating,
+                 "update_state_checked": flags is not None}
+        if not unique:
+            return found
+    if found is not None:
+        return found
     raise ValueError("Installed Steam game not found")
+
+
+def inside_game(game, record):
+    root = game["game_directory"]
+    return os.path.commonpath([root, record["game_dir"]]) == root
 
 
 def relative_executable(value):

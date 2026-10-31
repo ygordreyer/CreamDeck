@@ -37,6 +37,9 @@ class WindowsTestDirectory(Directory):
     def child(self, name):
         return type(self)(str(self.path / component(name)))
 
+    def parent(self):
+        return type(self)(str(self.path.parent))
+
     def ensure_child_dir(self, name):
         path = self.path / component(name)
         path.mkdir(exist_ok=True)
