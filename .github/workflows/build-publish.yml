@@ -1,9 +1,9 @@
 name: Build & Publish
 
 # Manually-triggered: bumps package.json's version (patch/minor/major, per the
-# chosen release_type — semantic versioning starting from 1.0.0), commits and
-# tags that bump on the triggering branch, then builds the plugin and
-# publishes it as a GitHub Release, packaged the way Decky Loader's "install
+# chosen release_type, semantic versioning starting from 1.0.0), builds and
+# verifies the package, then commits and tags that bump on the triggering
+# branch and publishes it as a GitHub Release, packaged for Decky's "install
 # from zip" expects — a single zip whose only top-level entry is a folder
 # named after the plugin. The `notes` input becomes the release's summary
 # line — fill it in with what actually changed; left blank, it falls back to
@@ -77,18 +77,6 @@ jobs:
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
           echo "Bumping $CURRENT -> $NEW (${{ inputs.release_type }})"
 
-      - name: Commit and tag version bump
-        id: release_commit
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json
-          git commit -m "Release v${{ steps.bump.outputs.version }}"
-          git tag "v${{ steps.bump.outputs.version }}"
-          git push origin HEAD:${{ github.ref_name }}
-          git push origin "v${{ steps.bump.outputs.version }}"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -111,6 +99,18 @@ jobs:
 
       - name: Stage and verify plugin package
         run: python scripts/package_release.py
+
+      - name: Commit and tag version bump
+        id: release_commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "Release v${{ steps.bump.outputs.version }}"
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push origin HEAD:${{ github.ref_name }}
+          git push origin "v${{ steps.bump.outputs.version }}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         uses: softprops/action-gh-release@v3

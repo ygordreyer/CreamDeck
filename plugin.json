@@ -8,7 +8,7 @@
       "steam",
       "smokeapi"
     ],
-    "description": "SmokeAPI for one owner-approved offline Proton game at a time, with hash-checked recovery.",
+    "description": "Per-game SmokeAPI installs for owner-approved offline Proton games, with hash-checked recovery.",
     "image": ""
   }
 }

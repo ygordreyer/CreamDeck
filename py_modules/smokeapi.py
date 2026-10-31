@@ -147,7 +147,8 @@ def folders_overlap(first, second):
 
 def recorded_names(record):
     return (set(record["originals"]) | set(record["installed"]) | set(record["created"])
-            | set(record["stages"].values()) | set(record["foreign_proxies"]))
+            | set(record["stages"].values()) | set(record["foreign_proxies"])
+            | ({record["config_update"]["stage"], record["config_update"]["backup"]} if record.get("config_update") else set()))
 
 
 def folder_identities(paths):
@@ -298,6 +299,7 @@ class Installer:
                           "phase": "installing", "original_launch_options": original_launch,
                           "set_launch_options": desired, "enabled_dlc_ids": enabled,
                           "quarantine": {}, "launch_restore": "acknowledged",
+                          "launch_setup": "pending" if mode == "proxy" else "acknowledged",
                           "foreign_proxies": foreign_proxies}
                 self.store.save(record)
                 directory.bind_journal(record, self.store.save)
@@ -319,6 +321,133 @@ class Installer:
                     raise
                 return record
 
+    def save_dlc_selection(self, value, enabled):
+        with LOCK:
+            value = app_id(value)
+            if not isinstance(enabled, list) or len(enabled) > 1000:
+                raise ValueError("Invalid DLC list")
+            enabled = sorted({app_id(x) for x in enabled})
+            record = self.store.load(value)
+            if not record or record["phase"] != "installed":
+                raise ValueError("An installed game is required")
+            game = self.find_game(value)
+            if not inside_game(game, record):
+                raise ValueError("Manifest game directory changed. Inspect the record manually")
+            assert_game_idle(game)
+            with Directory(game["game_directory"]) as root:
+                anti_cheat(root)
+            with Directory(record["game_dir"]) as directory:
+                directory.bind_journal(record, self.store.save)
+                self._recover_config(record, directory)
+                if self.status(value)[0] != "installed":
+                    raise ValueError("Installation changed. Recover it before saving DLC")
+                original = directory.read(CONFIG)
+                config = json.loads(original)
+                config["override_dlc_status"] = {x: "unlocked" for x in enabled}
+                payload = json.dumps(config, indent=2).encode()
+                if record["enabled_dlc_ids"] == enabled and digest(payload) == record["installed"][CONFIG]:
+                    return record
+                directory.rename_preflight()
+                update = {"old": record["installed"][CONFIG], "new": digest(payload), "ids": enabled,
+                          "stage": ".cdh-" + uuid.uuid4().hex, "backup": ".cdh-" + uuid.uuid4().hex,
+                          "committed": False}
+                update["writes"] = {
+                    update[role]: {"began": True, "sha256": digest(data), "size": len(data),
+                                   "payload": data.decode("utf-8"), "partial_size": None}
+                    for role, data in (("stage", payload), ("backup", original))}
+                record["config_update"] = update
+                self.store.save(record)
+                try:
+                    directory.write_new(update["stage"], payload)
+                    directory.write_new(update["backup"], original)
+                    current_game = self.find_game(value)
+                    if not inside_game(current_game, record):
+                        raise ValueError("Manifest game directory changed. Inspect the record manually")
+                    assert_game_idle(current_game, ignored_fds=(getattr(directory, "fd", None),))
+                    directory.delete(CONFIG, update["old"])
+                    directory.rename(update["stage"], CONFIG, update["new"])
+                    record["installed"][CONFIG] = update["new"]
+                    record["enabled_dlc_ids"] = enabled
+                    update["committed"] = True
+                    self.store.save(record)
+                except BaseException:
+                    # Reload the durable decision, including an ambiguous settings fsync failure.
+                    saved = self.store.load(value)
+                    directory.bind_journal(saved, self.store.save)
+                    self._recover_config(saved, directory)
+                    raise
+                self._recover_config(record, directory)
+            return record
+
+    def _recover_config(self, record, directory):
+        update = record.get("config_update")
+        if not update:
+            return
+        game = self.find_game(record["app_id"])
+        if not inside_game(game, record):
+            raise ValueError("Manifest game directory changed. Inspect the record manually")
+        assert_game_idle(game, ignored_fds=(getattr(directory, "fd", None),))
+        warnings = directory.recover_quarantine()
+        if warnings:
+            raise ValueError("; ".join(warnings))
+        known = {*record["stages"].values(), update["stage"], update["backup"], *record["quarantine"]}
+        if any(name.startswith(".cdh-") and name not in known for name in directory.names()):
+            raise ValueError("Unrecorded config staging file preserved")
+        # A recorded prefix is ours, but its observed hash must also survive
+        # quarantine journaling before deletion can be retried after a crash.
+        partials = []
+        for role, sha in (("stage", update["new"]), ("backup", update["old"])):
+            name = update[role]
+            try:
+                current = directory.hash(name)
+            except (OSError, ValueError) as error:
+                raise ValueError("Unsafe config staging file preserved") from error
+            if current is None or current == sha:
+                continue
+            intent = update.get("writes", {}).get(name)
+            data = directory.read(name)
+            if (not intent or not intent["began"] or len(data) >= intent["size"]
+                    or not intent["payload"].encode("utf-8").startswith(data)):
+                raise ValueError("Changed config staging file preserved")
+            partials.append((name, intent, data))
+        for name, intent, data in partials:
+            intent["partial_size"] = len(data)
+            self.store.save(record)
+            directory.delete(name, digest(data))
+        current = directory.hash(CONFIG)
+        if update["committed"]:
+            if current != update["new"]:
+                raise ValueError("Config changed during update; preserved for recovery")
+        else:
+            if current == update["new"] and directory.hash(update["backup"]) == update["old"]:
+                directory.rename(CONFIG, update["stage"], update["new"])
+                current = None
+            if current is None and directory.hash(update["backup"]) == update["old"]:
+                directory.rename(update["backup"], CONFIG, update["old"])
+            elif current != update["old"]:
+                raise ValueError("Config changed during update; preserved for recovery")
+        for name, sha in ((update["stage"], update["new"]), (update["backup"], update["old"])):
+            current = directory.hash(name)
+            if current is not None:
+                if current != sha:
+                    raise ValueError("Changed config staging file preserved for recovery")
+                directory.delete(name, sha)
+        del record["config_update"]
+        self.store.save(record)
+
+    def resolve_setup(self, value, manual=False):
+        with LOCK:
+            value = app_id(value)
+            record = self.store.load(value)
+            if not record or record["phase"] != "installed" or record["mode"] != "proxy":
+                raise ValueError("An installed proxy is required")
+            if type(manual) is not bool or (record["set_launch_options"] is None and not manual):
+                raise ValueError("Confirm manual launch setup")
+            self.find_game(value)
+            record["launch_setup"] = "manual" if manual else "acknowledged"
+            self.store.save(record)
+            return record
+
     def status(self, value):
         with LOCK:
             record = self.store.load(app_id(value))
@@ -328,6 +457,8 @@ class Installer:
             if not inside_game(game, record):
                 return "game directory changed", record
             with Directory(record["game_dir"]) as directory:
+                if record.get("config_update"):
+                    return "interrupted DLC update; use Save or Remove", record
                 if record["phase"] != "installed":
                     return "interrupted operation; use Remove / recover", record
                 for name, sha in record["installed"].items():
@@ -351,6 +482,8 @@ class Installer:
                 raise ValueError("Manifest game directory changed. Inspect the record manually")
             assert_game_idle(game)
             with Directory(record["game_dir"]) as directory:
+                directory.bind_journal(record, self.store.save)
+                self._recover_config(record, directory)
                 warnings = self._remove(record, directory)
             return record, warnings
 

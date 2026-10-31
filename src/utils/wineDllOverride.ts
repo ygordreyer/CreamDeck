@@ -53,13 +53,13 @@ export async function changeLaunchOptions(appId: number, record: InstallRecord, 
   }
   const current = await getAppLaunchOptions(appId);
   if (current === desired) {
-    if (restore) await acknowledge?.();
+    await acknowledge?.();
     return "Launch options already match";
   }
   if (current !== expected) return "Launch options changed; left untouched. Restore the original manually in Steam Properties";
   SteamClient.Apps.SetAppLaunchOptions(appId, desired);
   const after = await getAppLaunchOptions(appId);
   if (after !== desired) throw new Error("Steam did not confirm the launch-option change. Check Steam Properties");
-  if (restore) await acknowledge?.();
+  await acknowledge?.();
   return restore ? "Original launch options restored" : "Wine launch override applied";
 }

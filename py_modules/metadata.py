@@ -1,14 +1,20 @@
 """Bounded HTTPS metadata only. No executable downloads or disk cache."""
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import ContextVar
 import json
 import os
 import ssl
+import time
 import urllib.request
 from safe_fs import app_id
 
 MAX_RESPONSE = 2 * 1024 * 1024
 MAX_NAMED_DLCS = 64
+DEADLINE = 12
+LOOKUPS = ThreadPoolExecutor(2, thread_name_prefix="creamdeck-metadata")
+NAMES = ThreadPoolExecutor(8, thread_name_prefix="creamdeck-dlc-names")
+EXPIRES = ContextVar("metadata_expires", default=None)
 # Decky's frozen Python looks for CAs under the build host's /usr/lib/ssl, which SteamOS lacks,
 # so every HTTPS lookup failed verification and read as "no DLC".
 CA_FILES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem")
@@ -29,8 +35,12 @@ def tls_context():
 
 
 def fetch(url):
+    expires = EXPIRES.get()
+    timeout = min(10, expires - time.monotonic()) if expires is not None else 10
+    if timeout <= 0:
+        raise TimeoutError("Metadata deadline exceeded")
     opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=tls_context()))
-    with opener.open(url, timeout=10) as response:
+    with opener.open(url, timeout=timeout) as response:
         body = response.read(MAX_RESPONSE + 1)
         if len(body) > MAX_RESPONSE:
             raise ValueError("Metadata response exceeds size limit")
@@ -39,6 +49,15 @@ def fetch(url):
 
 def lookup(value):
     value = app_id(value)
+    expires = time.monotonic() + DEADLINE
+    token = EXPIRES.set(expires)
+    try:
+        return _lookup(value, expires)
+    finally:
+        EXPIRES.reset(token)
+
+
+def _lookup(value, expires):
     ids = []
     try:
         data = fetch(f"https://api.steamcmd.net/v1/info/{value}")
@@ -51,12 +70,24 @@ def lookup(value):
     if not ids:
         try:
             data = fetch(f"https://store.steampowered.com/api/appdetails?appids={value}&filters=basic")
-            ids = [app_id(str(x)) for x in data.get(value, {}).get("data", {}).get("dlc", [])]
+            entry = data.get(value, {})
+            if not isinstance(entry.get("data"), dict) or entry.get("success") is False:
+                raise ValueError("DLC metadata unavailable")
+            ids = [app_id(str(x)) for x in entry["data"].get("dlc", [])]
         except (OSError, ValueError, TypeError, AttributeError):
-            pass
+            raise ValueError("DLC metadata unavailable") from None
     ids = sorted(set(ids))[:1000]
-    with ThreadPoolExecutor(8) as pool:
-        names = list(pool.map(dlc_name, ids[:MAX_NAMED_DLCS]))
+    def name_before_deadline(value):
+        token = EXPIRES.set(expires)
+        try:
+            return dlc_name(value)
+        finally:
+            EXPIRES.reset(token)
+    futures = [NAMES.submit(name_before_deadline, value) for value in ids[:MAX_NAMED_DLCS]]
+    wait(futures, timeout=max(0, expires - time.monotonic()))
+    names = [future.result() if future.done() and not future.cancelled() else None for future in futures]
+    for future in futures:
+        future.cancel()
     names += [None] * (len(ids) - len(names))
     return [{"id": x, "name": name or f"DLC {x}"} for x, name in zip(ids, names)]
 
@@ -69,6 +100,10 @@ def dlc_name(value):
         return None
 
 
-async def dlcs(value):
+async def dlcs(value, deadline=DEADLINE):
     app_id(value)
-    return await asyncio.to_thread(lookup, value)
+    try:
+        result = await asyncio.wait_for(asyncio.wrap_future(LOOKUPS.submit(lookup, value)), deadline)
+        return {"state": "ready", "dlcs": result}
+    except (OSError, ValueError, TypeError, AttributeError, asyncio.TimeoutError):
+        return {"state": "unavailable", "dlcs": []}

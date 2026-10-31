@@ -33,13 +33,27 @@ class Plugin:
                 status, record = instance.status(app_id)
                 return {"found": True, "name": game["name"], "status": status,
                         "allowed": app_id in instance.store.allowlist(), "record": record,
+                        "dlcs": [{"id": value, "name": f"DLC {value}"} for value in (record or {}).get("enabled_dlc_ids", [])],
                         "available_proxies": available_proxies(game["game_directory"])}
         try:
-            result = await asyncio.to_thread(read)
-            result["dlcs"] = await metadata.dlcs(app_id)
-            return result
+            return await asyncio.to_thread(read)
         except Exception as error:
             return {"found": False, "error": str(error)}
+
+    async def get_game_metadata(self, app_id: str):
+        require_user()
+        return await metadata.dlcs(app_id)
+
+    async def get_library_availability(self):
+        require_user()
+        _, unavailable = await asyncio.to_thread(steam_library.library_availability)
+        return {"unavailable": unavailable}
+
+    async def save_dlc_selection(self, app_id: str, enabled_dlc_ids: list[str]):
+        return await self._operation(lambda: {"record": backend().save_dlc_selection(app_id, enabled_dlc_ids)})
+
+    async def acknowledge_launch_setup(self, app_id: str, manual: bool = False):
+        return await self._operation(lambda: {"record": backend().resolve_setup(app_id, manual)})
 
     async def allow_game(self, app_id: str, confirmed: bool):
         def allow():

@@ -18,9 +18,24 @@ import {
 import type { FC } from "react";
 
 const MENU_ITEM_KEY = "creamdeck-hardened";
+const isValidAppId = (appid: unknown): appid is number =>
+  typeof appid === "number" && Number.isSafeInteger(appid) && appid > 0;
+let menuAvailable = false;
+const statusListeners = new Set<(available: boolean) => void>();
+export const menuPatchAvailable = () => menuAvailable;
+export function subscribeMenuPatchStatus(listener: (available: boolean) => void) {
+  statusListeners.add(listener);
+  return () => { statusListeners.delete(listener); };
+}
+function setMenuAvailable(available: boolean) {
+  if (menuAvailable === available) return;
+  menuAvailable = available;
+  statusListeners.forEach((listener) => listener(available));
+}
 
 // Always add before "Properties..."
 const spliceMenuItem = (children: any[], appid: number) => {
+  if (!isValidAppId(appid)) throw new Error("Invalid app id");
   const propertiesMenuItemIdx = children.findIndex((item) =>
     findInReactTree(item, (x) => x?.onSelected?.toString().includes("AppProperties")),
   );
@@ -36,6 +51,7 @@ const spliceMenuItem = (children: any[], appid: number) => {
       CreamDeck Hardened
     </MenuItem>,
   );
+  setMenuAvailable(true);
 };
 
 // Check if correct menu by looking at the code of the onSelected function.
@@ -53,21 +69,26 @@ const handleItemDupes = (items: any[]) => {
 };
 
 const patchMenuItems = (menuItems: any[], appid: number) => {
-  let updatedAppid: number = appid;
+  let overviewAppid: number | undefined;
+  let appAppid: number | undefined;
   // find the first menu component that has the correct appid, sometimes the one passed is cached from another context menu
-  const parentOverview = menuItems.find(
-    (x: any) => x?._owner?.pendingProps?.overview?.appid && x._owner.pendingProps.overview.appid !== appid,
-  );
-  if (parentOverview) {
-    updatedAppid = parentOverview._owner.pendingProps.overview.appid;
-  }
-  if (updatedAppid === appid) {
-    const foundApp = findInTree(menuItems, (x) => x?.app?.appid, { walkable: ["props", "children"] });
-    if (foundApp) {
-      updatedAppid = foundApp.app.appid;
+  for (const item of menuItems) {
+    const suppliedAppid = item?._owner?.pendingProps?.overview?.appid;
+    if (suppliedAppid !== undefined) {
+      if (!isValidAppId(suppliedAppid)) throw new Error("Invalid app id");
+      if (overviewAppid === undefined && suppliedAppid !== appid) overviewAppid = suppliedAppid;
     }
   }
-  spliceMenuItem(menuItems, updatedAppid);
+  findInTree(menuItems, (x) => {
+    const suppliedAppid = x?.app?.appid;
+    if (suppliedAppid !== undefined) {
+      if (!isValidAppId(suppliedAppid)) throw new Error("Invalid app id");
+      if (appAppid === undefined) appAppid = suppliedAppid;
+    }
+    // Validate every supplied identity before inserting, including those after the first match.
+    return false;
+  }, { walkable: ["props", "children"] });
+  spliceMenuItem(menuItems, overviewAppid ?? appAppid ?? appid);
 };
 
 /**
@@ -78,7 +99,7 @@ const patchMenuItems = (menuItems: any[], appid: number) => {
 let activePatch: { unpatch: () => void } | undefined;
 const contextMenuPatch = (LibraryContextMenu: any) => {
   if (activePatch) return activePatch;
-  if (!LibraryContextMenu?.prototype) return undefined;
+  if (!LibraryContextMenu?.prototype) { setMenuAvailable(false); return undefined; }
   const nested: Patch[] = [];
   const patchedPrototypes = new WeakSet<object>();
   let currentAppId: number | undefined;
@@ -94,7 +115,7 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
   };
   patches.outer = afterPatch(LibraryContextMenu.prototype, "render", (_: Record<string, unknown>[], component: any) => {
     try {
-    let appid: number | undefined;
+    let appid: unknown;
     if (component?._owner?.pendingProps?.overview) {
       appid = component._owner.pendingProps.overview.appid;
     } else {
@@ -103,24 +124,30 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
         appid = foundApp.app.appid;
       }
     }
-    currentAppId = appid;
-    if (appid === undefined) {
+    if (!isValidAppId(appid)) {
+      currentAppId = undefined;
+      setMenuAvailable(false);
       return component;
     }
+    currentAppId = appid;
 
     if (!patches.inner) {
       patches.inner = afterPatch(component, "type", (_: any, ret: any) => {
         try {
         const prototype = ret?.type?.prototype;
-        if (!prototype || patchedPrototypes.has(prototype)) return ret;
+        if (!prototype) { setMenuAvailable(false); return ret; }
+        if (patchedPrototypes.has(prototype)) return ret;
         patchedPrototypes.add(prototype);
         nested.push(afterPatch(prototype, "render", (_: any, ret2: any) => {
           const menuItems = ret2?.props?.children?.[0];
-          if (!Array.isArray(menuItems) || !isOpeningAppContextMenu(menuItems) || !currentAppId) return ret2;
+          if (!Array.isArray(menuItems)) { setMenuAvailable(false); return ret2; }
+          if (!isOpeningAppContextMenu(menuItems) || !isValidAppId(currentAppId)) { setMenuAvailable(false); return ret2; }
           try {
             handleItemDupes(menuItems);
             patchMenuItems(menuItems, currentAppId);
           } catch (error) {
+            currentAppId = undefined;
+            setMenuAvailable(false);
             return ret2;
           }
           return ret2;
@@ -129,11 +156,13 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
         // when Steam decides to refresh the app overview
         nested.push(afterPatch(prototype, "shouldComponentUpdate", ([nextProps]: any, shouldUpdate: any) => {
           try {
-            if (!Array.isArray(nextProps?.children) || !currentAppId) return shouldUpdate;
+            if (!isValidAppId(currentAppId)) { setMenuAvailable(false); return shouldUpdate; }
+            if (!Array.isArray(nextProps?.children)) return shouldUpdate;
             handleItemDupes(nextProps.children);
             if (shouldUpdate === true) patchMenuItems(nextProps.children, currentAppId);
           } catch (error) {
-            // wrong context menu (probably)
+            currentAppId = undefined;
+            setMenuAvailable(false);
             return shouldUpdate;
           }
 
@@ -141,22 +170,22 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
           return shouldUpdate;
         }));
         return ret;
-        } catch { return ret; }
+        } catch { setMenuAvailable(false); return ret; }
       });
     } else {
-      if (Array.isArray(component?.props?.children)) {
-        try { handleItemDupes(component.props.children); spliceMenuItem(component.props.children, appid); } catch { /* Steam layout changed. */ }
+      if (isValidAppId(currentAppId) && Array.isArray(component?.props?.children)) {
+        try { handleItemDupes(component.props.children); spliceMenuItem(component.props.children, currentAppId); } catch { setMenuAvailable(false); }
       }
     }
     return component;
-    } catch { return component; }
+    } catch { setMenuAvailable(false); return component; }
   });
   patches.unpatch = () => {
     if (disposed) return;
     disposed = true;
     for (const patch of nested.splice(0).reverse()) { try { patch.unpatch(); } catch { /* Continue removing all handles. */ } }
     try { patches.inner?.unpatch(); } catch { /* Continue removing all handles. */ }
-    try { patches.outer?.unpatch(); } finally { activePatch = undefined; }
+    try { patches.outer?.unpatch(); } finally { activePatch = undefined; setMenuAvailable(false); }
   };
   activePatch = patches;
   return patches;

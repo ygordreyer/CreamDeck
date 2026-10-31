@@ -79,11 +79,12 @@ def steam_path():
                   if os.path.isdir(os.path.join(home, suffix))), None)
 
 
-def library_folders():
+def library_availability():
     steam = steam_path()
     if not steam:
-        return []
+        return [], []
     folders = [os.path.join(steam, "steamapps")]
+    unavailable = []
     with Directory(folders[0]) as directory:
         if directory.exists("libraryfolders.vdf"):
             data = get_child(parse(directory.read("libraryfolders.vdf").decode("utf-8")), "libraryfolders")
@@ -93,14 +94,23 @@ def library_folders():
                 if not key.isdecimal() or not isinstance(entry, dict):
                     continue
                 path = get_child(entry, "path")
-                if not isinstance(path, str) or not os.path.isabs(path) or not os.path.isdir(path):
-                    raise ValueError("Steam library must be absolute and existing")
+                if not isinstance(path, str) or not os.path.isabs(path):
+                    raise ValueError("Steam library must be absolute")
                 folder = os.path.join(path, "steamapps")
-                with Directory(folder):
-                    pass
+                try:
+                    with Directory(folder):
+                        pass
+                except OSError:
+                    apps = get_child(entry, "apps")
+                    unavailable.append({"path": folder, "apps": list(apps) if isinstance(apps, dict) else []})
+                    continue
                 if folder not in folders:
                     folders.append(folder)
-    return folders
+    return folders, unavailable
+
+
+def library_folders():
+    return library_availability()[0]
 
 
 def confined_game(library, install_dir):
@@ -144,6 +154,8 @@ def find_game(value, *, unique=False):
             return found
     if found is not None:
         return found
+    if any(value in library["apps"] for library in library_availability()[1]):
+        raise ValueError("Game storage unavailable")
     raise ValueError("Installed Steam game not found")
 
 

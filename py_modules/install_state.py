@@ -5,7 +5,7 @@ import os
 import re
 import threading
 import steam_library
-from safe_fs import Directory, app_id, component
+from safe_fs import Directory, app_id, component, digest
 
 LOCK = threading.RLock()
 PROXIES = ("version", "winmm", "winhttp")
@@ -14,7 +14,7 @@ CONFIG = "SmokeAPI.config.json"
 FIELDS = {"schema", "app_id", "game_dir", "mode", "proxy_name", "originals", "installed",
           "created", "stages", "phase", "original_launch_options", "set_launch_options", "enabled_dlc_ids",
           "quarantine", "launch_restore", "foreign_proxies"}
-OPTIONAL_FIELDS = {"game_directory"}
+OPTIONAL_FIELDS = {"game_directory", "launch_setup", "config_update"}
 
 
 def locked(function):
@@ -102,6 +102,11 @@ def validate(record, value):
         raise ValueError("Invalid launch restoration state")
     if record["mode"] == "direct" and record["launch_restore"] == "pending":
         record = {**record, "launch_restore": "acknowledged"}
+    if "launch_setup" not in record:
+        record = {**record, "launch_setup": "pending" if record["mode"] == "proxy" and record["phase"] == "installed" else "acknowledged"}
+    if "launch_setup" in record and (record["launch_setup"] not in ("pending", "acknowledged", "manual")
+            or (record["mode"] == "direct" and record["launch_setup"] != "acknowledged")):
+        raise ValueError("Invalid proxy setup state")
     foreign = record["foreign_proxies"]
     if not isinstance(foreign, dict) or (foreign and record["mode"] != "direct"):
         raise ValueError("Invalid foreign proxy journal")
@@ -111,6 +116,49 @@ def validate(record, value):
                 or not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{64}", sha)):
             raise ValueError("Invalid foreign proxy hash or name")
     allowed = set()
+    update = record.get("config_update")
+    if update is not None:
+        if (not isinstance(update, dict) or set(update) not in (
+                {"old", "new", "ids", "stage", "backup", "committed"},
+                {"old", "new", "ids", "stage", "backup", "committed", "writes"})
+                or record["phase"] != "installed" or type(update["committed"]) is not bool
+                or any(not isinstance(update[k], str) or not re.fullmatch("[0-9a-f]{64}", update[k]) for k in ("old", "new"))
+                or record["installed"][CONFIG] != update["new" if update["committed"] else "old"]
+                or not isinstance(update["ids"], list) or len(update["ids"]) > 1000
+                or any(not isinstance(update[k], str) or not re.fullmatch(r"\.cdh-[0-9a-f]{32}", update[k]) for k in ("stage", "backup"))
+                or update["stage"] == update["backup"]
+                or {update["stage"], update["backup"]} & set(record["stages"].values())):
+            raise ValueError("Invalid config update journal")
+        for value_id in update["ids"]:
+            app_id(value_id)
+        if "writes" in update:
+            writes = update["writes"]
+            if not isinstance(writes, dict) or set(writes) != {update["stage"], update["backup"]}:
+                raise ValueError("Invalid config write journal")
+            for role, expected in (("stage", update["new"]), ("backup", update["old"])):
+                name = update[role]
+                intent = writes[name]
+                if (not isinstance(intent, dict)
+                        or set(intent) != {"began", "sha256", "size", "payload", "partial_size"}
+                        or intent["began"] is not True or intent["sha256"] != expected
+                        or type(intent["size"]) is not int or not 0 < intent["size"] <= 64 * 1024
+                        or not isinstance(intent["payload"], str)):
+                    raise ValueError("Invalid config write intent")
+                payload = intent["payload"].encode("utf-8")
+                if len(payload) != intent["size"] or digest(payload) != expected:
+                    raise ValueError("Invalid config write payload")
+                partial = intent["partial_size"]
+                if partial is not None:
+                    if type(partial) is not int or not 0 <= partial < intent["size"]:
+                        raise ValueError("Invalid interrupted config write")
+                    allowed.add((name, None, digest(payload[:partial])))
+            allowed.add((CONFIG, None, update["old"]))
+        allowed.update(((CONFIG, update["backup"], update["old"]),
+                        (update["backup"], CONFIG, update["old"]),
+                        (update["backup"], None, update["old"]),
+                        (update["stage"], CONFIG, update["new"]),
+                        (CONFIG, update["stage"], update["new"]),
+                        (update["stage"], None, update["new"])))
     for name, sha in record["installed"].items():
         stage = record["stages"][name]
         allowed.update(((stage, name, sha), (stage, None, sha), (name, None, sha)))

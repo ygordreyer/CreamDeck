@@ -1794,11 +1794,356 @@ class BackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "within 16 folders"):
             smokeapi.api_directory(str(self.game))
 
-    def test_library_paths_must_be_absolute_existing(self):
-        for path in ("relative", str(self.base / "missing")):
+    def test_library_paths_must_be_absolute(self):
+        for path in ("relative",):
             (self.library / "libraryfolders.vdf").write_text('"libraryfolders" { "1" { "path" "' + path.replace("\\", "\\\\") + '" } }')
             with self.assertRaises(ValueError):
                 steam_library.find_game("123")
+
+    def test_unavailable_library_does_not_block_internal_game(self):
+        path = str(self.base / "missing").replace("\\", "\\\\")
+        (self.library / "libraryfolders.vdf").write_text(
+            '"libraryfolders" { "1" { "path" "' + path + '" "apps" { "456" "1" } } }')
+        self.assertEqual("123", steam_library.find_game("123")["app_id"])
+        self.install()
+        self.assertEqual("installed", self.engine.status("123")[0])
+        self.assertEqual(1, len(steam_library.library_availability()[1]))
+        with self.assertRaisesRegex(ValueError, "storage unavailable"):
+            steam_library.find_game("456")
+        self.assertEqual([], self.engine.uninstall("123")[1])
+
+    def test_save_dlc_selection_is_transactional_and_isolated(self):
+        other = self.other_game()
+        self.engine.install("456", "direct", "version", ["789"], "")
+        other_before = self.tree_snapshot(other)
+        self.install()
+        dlls = {name: data for name, data in self.snapshot().items() if name.endswith(".dll")}
+        saved = self.engine.save_dlc_selection("123", ["987", "654"])
+        self.assertEqual(["654", "987"], saved["enabled_dlc_ids"])
+        self.assertEqual(saved, self.store.load("123"))
+        self.assertEqual("installed", self.engine.status("123")[0])
+        config = json.loads((self.game / install_state.CONFIG).read_bytes())
+        self.assertEqual({"654": "unlocked", "987": "unlocked"}, config["override_dlc_status"])
+        self.assertEqual(dlls, {name: data for name, data in self.snapshot().items() if name.endswith(".dll")})
+        self.assertEqual(other_before, self.tree_snapshot(other))
+        self.assertNotIn("config_update", saved)
+
+    def test_save_dlc_selection_rolls_back_failed_config_publish(self):
+        self.install()
+        before = self.snapshot()
+        original = TestDirectory.rename
+        def fail(directory, source, target, sha):
+            if target == install_state.CONFIG and sha != safe_fs.digest(before[install_state.CONFIG]):
+                raise OSError("simulated publish failure")
+            return original(directory, source, target, sha)
+        with patch.object(TestDirectory, "rename", fail):
+            with self.assertRaisesRegex(OSError, "simulated"):
+                self.engine.save_dlc_selection("123", ["456"])
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual([], self.store.load("123")["enabled_dlc_ids"])
+        self.assertEqual("installed", self.engine.status("123")[0])
+
+    def test_proxy_setup_pending_round_trip_and_acknowledgment(self):
+        (self.game / "steam_api.dll").unlink()
+        saved = self.install("proxy")
+        self.assertEqual("pending", saved["launch_setup"])
+        self.assertEqual("pending", self.store.load("123")["launch_setup"])
+        self.assertEqual("installed", self.engine.status("123")[0])
+        before = self.tree_snapshot()
+        self.engine.resolve_setup("123")
+        self.assertEqual("acknowledged", self.store.load("123")["launch_setup"])
+        self.assertEqual("installed", self.engine.status("123")[0])
+        self.assertEqual(before, self.tree_snapshot())
+
+    def test_legacy_proxy_setup_is_pending_until_explicit_acknowledgment(self):
+        (self.game / "steam_api.dll").unlink()
+        record = self.install("proxy")
+        del record["launch_setup"]
+        (self.settings / "123.json").write_text(json.dumps(record))
+        self.assertEqual("pending", self.store.load("123")["launch_setup"])
+        self.engine.resolve_setup("123")
+        self.assertEqual("acknowledged", self.store.load("123")["launch_setup"])
+
+    def test_save_dlc_selection_rejects_changed_files_busy_game_and_anti_cheat(self):
+        self.install()
+        for failure in ("changed", "busy", "anti-cheat"):
+            with self.subTest(failure=failure):
+                original = (self.game / install_state.CONFIG).read_bytes()
+                if failure == "changed":
+                    (self.game / install_state.CONFIG).write_bytes(b"owner config")
+                if failure == "anti-cheat":
+                    (self.game / "EasyAntiCheat").mkdir()
+                before = self.tree_snapshot()
+                with patch.object(smokeapi, "assert_game_idle", side_effect=ValueError("busy") if failure == "busy" else None):
+                    with self.assertRaises(ValueError):
+                        self.engine.save_dlc_selection("123", ["456"])
+                self.assertEqual(before, self.tree_snapshot())
+                self.assertEqual([], self.store.load("123")["enabled_dlc_ids"])
+                (self.game / install_state.CONFIG).write_bytes(original)
+                if failure == "anti-cheat":
+                    (self.game / "EasyAntiCheat").rmdir()
+
+    def test_config_update_crash_recovery_at_every_mutation_boundary(self):
+        class Crash(BaseException):
+            pass
+        self.install()
+        original = self.snapshot()
+        real_save = self.store.save
+        # A power loss bypasses the in-process rollback so the saved journal must suffice.
+        for boundary in range(1, 18):
+            count = 0
+            def crash_after_save(record):
+                nonlocal count
+                real_save(record)
+                if record.get("config_update"):
+                    count += 1
+                    if count == boundary:
+                        raise Crash()
+            with self.subTest(boundary=boundary), patch.object(self.store, "save", side_effect=crash_after_save), \
+                    patch.object(self.store, "load", wraps=self.store.load) as load:
+                # Simulate process death: rollback cannot reopen settings.
+                real_load = load._mock_wraps
+                def read(value):
+                    if count == boundary:
+                        raise Crash()
+                    return real_load(value)
+                load.side_effect = read
+                try:
+                    self.engine.save_dlc_selection("123", ["456"])
+                except Crash:
+                    pass
+            saved = self.store.load("123")
+            if saved.get("config_update"):
+                self.assertIn("interrupted", self.engine.status("123")[0])
+            # Removal invokes journal recovery before touching any DLLs.
+            self.assertEqual([], self.engine.uninstall("123")[1])
+            self.assertEqual(self.before, self.snapshot())
+            self.install()
+            self.assertEqual(original, self.snapshot())
+
+    def interrupt_config_write(self, role="stage", fragment=lambda data: data[:5], verify_intent=True):
+        class Crash(BaseException):
+            pass
+        write, load = TestDirectory.write_new, self.store.load
+        interrupted = False
+        payload = None
+        def fail(directory, name, data):
+            nonlocal interrupted, payload
+            update = (load("123") or {}).get("config_update", {})
+            if name == update.get(role):
+                payload = data
+                write(directory, name, fragment(data))
+                interrupted = True
+                raise OSError("interrupted config payload write")
+            return write(directory, name, data)
+        def reopen(value):
+            if interrupted:
+                raise Crash()
+            return load(value)
+        with patch.object(TestDirectory, "write_new", fail), patch.object(self.store, "load", side_effect=reopen):
+            with self.assertRaises(Crash):
+                self.engine.save_dlc_selection("123", ["456"])
+        self.assertTrue(interrupted)
+        update = load("123")["config_update"]
+        if verify_intent:
+            intent = update.get("writes", {}).get(update[role], {})
+            self.assertEqual(True, intent.get("began"), "payload ownership must precede the write")
+            self.assertEqual(len(payload), intent.get("size"))
+            self.assertEqual(safe_fs.digest(payload), intent.get("sha256"))
+        return update
+
+    def test_interrupted_config_stage_write_then_save(self):
+        self.install()
+        dlls = {name: data for name, data in self.snapshot().items() if name.endswith(".dll")}
+        update = self.interrupt_config_write(verify_intent=False)
+        self.assertEqual(5, (self.game / update["stage"]).stat().st_size)
+        saved = self.engine.save_dlc_selection("123", ["456"])
+        self.assertEqual(["456"], saved["enabled_dlc_ids"])
+        self.assertNotIn("config_update", self.store.load("123"))
+        self.assertEqual("installed", self.engine.status("123")[0])
+        self.assertEqual(dlls, {name: data for name, data in self.snapshot().items() if name.endswith(".dll")})
+        self.assertFalse((self.game / update["stage"]).exists())
+
+    def test_interrupted_config_stage_write_then_remove(self):
+        self.install()
+        installed = self.snapshot()
+        self.interrupt_config_write(verify_intent=False)
+        original_remove = self.engine._remove
+        def remove(record, directory, **kwargs):
+            self.assertEqual(installed[install_state.CONFIG], directory.read(install_state.CONFIG))
+            return original_remove(record, directory, **kwargs)
+        with patch.object(self.engine, "_remove", side_effect=remove):
+            record, warnings = self.engine.uninstall("123")
+        self.assertEqual([], warnings)
+        self.assertEqual("removed", record["phase"])
+        self.assertEqual(self.before, self.snapshot())
+
+    def test_empty_config_stage_write_recovers(self):
+        self.install()
+        self.interrupt_config_write(fragment=lambda data: b"", verify_intent=False)
+        self.assertEqual(["456"], self.engine.save_dlc_selection("123", ["456"])["enabled_dlc_ids"])
+        self.assertEqual([], self.engine.uninstall("123")[1])
+        self.assertEqual(self.before, self.snapshot())
+
+    def assert_foreign_config_stage_blocks(self, fragment):
+        self.install()
+        update = self.interrupt_config_write(fragment=fragment)
+        before = self.tree_snapshot()
+        for action in (lambda: self.engine.save_dlc_selection("123", ["456"]),
+                       lambda: self.engine.uninstall("123")):
+            with self.assertRaisesRegex(ValueError, "[Pp]reserved"):
+                action()
+            self.assertEqual(before, self.tree_snapshot())
+            self.assertEqual(update, self.store.load("123")["config_update"])
+
+    def test_foreign_config_stage_bytes_are_preserved_and_block(self):
+        self.assert_foreign_config_stage_blocks(lambda data: b"alien")
+
+    def test_oversized_config_stage_is_preserved_and_blocks(self):
+        self.assert_foreign_config_stage_blocks(lambda data: data + b"extra")
+
+    def test_interrupted_config_backup_write_recovers(self):
+        for action in ("save", "remove"):
+            with self.subTest(action=action):
+                self.install()
+                self.interrupt_config_write(role="backup")
+                if action == "save":
+                    self.assertEqual(["456"], self.engine.save_dlc_selection("123", ["456"])["enabled_dlc_ids"])
+                self.assertEqual([], self.engine.uninstall("123")[1])
+                self.assertEqual(self.before, self.snapshot())
+
+    def test_nonregular_config_stage_is_preserved_and_blocks(self):
+        self.install()
+        update = self.interrupt_config_write()
+        stage = self.game / update["stage"]
+        stage.unlink()
+        stage.mkdir()
+        before = self.tree_snapshot()
+        for action in (lambda: self.engine.save_dlc_selection("123", ["456"]),
+                       lambda: self.engine.uninstall("123")):
+            with self.assertRaisesRegex(ValueError, "[Pp]reserved"):
+                action()
+            self.assertEqual(before, self.tree_snapshot())
+
+    def test_unrecorded_config_stage_is_preserved_and_blocks(self):
+        self.install()
+        update = self.interrupt_config_write()
+        unknown = self.game / (".cdh-" + "f" * 32)
+        unknown.write_bytes((self.game / update["stage"]).read_bytes())
+        before = self.tree_snapshot()
+        for action in (lambda: self.engine.save_dlc_selection("123", ["456"]),
+                       lambda: self.engine.uninstall("123")):
+            with self.assertRaisesRegex(ValueError, "Unrecorded.*preserved"):
+                action()
+            self.assertEqual(before, self.tree_snapshot())
+
+    def test_config_write_journal_rejects_forged_ownership(self):
+        self.install()
+        update = self.interrupt_config_write()
+        record = self.store.load("123")
+        intent = update["writes"][update["stage"]]
+        for field, bad in (("began", False), ("size", intent["size"] + 1), ("size", True),
+                           ("sha256", update["old"]), ("payload", "alien"),
+                           ("partial_size", intent["size"]), ("partial_size", -1)):
+            with self.subTest(field=field, bad=bad):
+                altered = copy.deepcopy(record)
+                altered["config_update"]["writes"][update["stage"]][field] = bad
+                with self.assertRaises(ValueError):
+                    install_state.validate(altered, "123")
+        altered = copy.deepcopy(record)
+        altered["config_update"]["writes"][".cdh-" + "e" * 32] = intent
+        with self.assertRaises(ValueError):
+            install_state.validate(altered, "123")
+
+    def test_partial_config_write_error_rolls_back_without_restart(self):
+        for role in ("stage", "backup"):
+            with self.subTest(role=role):
+                self.install()
+                before = self.snapshot()
+                write = TestDirectory.write_new
+                def fail(directory, name, data):
+                    update = (self.store.load("123") or {}).get("config_update", {})
+                    if name == update.get(role):
+                        write(directory, name, data[:5])
+                        raise OSError("interrupted config payload write")
+                    return write(directory, name, data)
+                with patch.object(TestDirectory, "write_new", fail):
+                    with self.assertRaisesRegex(OSError, "interrupted config payload write"):
+                        self.engine.save_dlc_selection("123", ["456"])
+                self.assertEqual(before, self.snapshot())
+                self.assertNotIn("config_update", self.store.load("123"))
+                self.assertEqual(["456"], self.engine.save_dlc_selection("123", ["456"])["enabled_dlc_ids"])
+                self.assertEqual([], self.engine.uninstall("123")[1])
+                self.assertEqual(self.before, self.snapshot())
+
+    def test_interrupted_partial_stage_cleanup_recovers_at_each_journal_boundary(self):
+        class Crash(BaseException):
+            pass
+        for boundary in range(1, 6):
+            with self.subTest(boundary=boundary):
+                self.install()
+                self.interrupt_config_write()
+                save = self.store.save
+                count = 0
+                def crash(record):
+                    nonlocal count
+                    save(record)
+                    count += 1
+                    if count == boundary:
+                        raise Crash()
+                with patch.object(self.store, "save", side_effect=crash):
+                    with self.assertRaises(Crash):
+                        self.engine.uninstall("123")
+                self.assertEqual([], self.engine.uninstall("123")[1])
+                self.assertEqual(self.before, self.snapshot())
+
+    def test_config_update_schema_refuses_path_aliases_and_unknown_transitions(self):
+        record = self.install()
+        update = {"old": record["installed"][install_state.CONFIG], "new": "a" * 64,
+                  "ids": ["456"], "stage": ".cdh-" + "1" * 32, "backup": ".cdh-" + "2" * 32,
+                  "committed": False}
+        for field, bad in (("stage", "../outside"), ("backup", record["stages"][install_state.CONFIG]),
+                           ("new", "invalid"), ("ids", ["../123"]), ("committed", 1)):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                install_state.validate({**record, "config_update": {**update, field: bad}}, "123")
+
+    def test_dlc_update_new_writer_defers_rollback_until_game_is_closed(self):
+        self.install()
+        before = self.snapshot()
+        checks = 0
+        def idle(game, **kwargs):
+            nonlocal checks
+            checks += 1
+            if checks > 1:
+                raise ValueError("Close the game first")
+        with patch.object(smokeapi, "assert_game_idle", side_effect=idle):
+            with self.assertRaisesRegex(ValueError, "Close the game"):
+                self.engine.save_dlc_selection("123", ["456"])
+        saved = self.store.load("123")
+        self.assertIn("config_update", saved)
+        self.assertEqual(before[install_state.CONFIG], (self.game / install_state.CONFIG).read_bytes())
+        self.engine.save_dlc_selection("123", ["456"])
+        self.assertEqual(["456"], self.store.load("123")["enabled_dlc_ids"])
+        self.assertEqual("installed", self.engine.status("123")[0])
+
+    def test_proxy_setup_rpc_and_dlc_save_preserve_other_game_with_offline_metadata(self):
+        self.other_game()
+        self.engine.install("456", "proxy", "version", ["789"], "")
+        self.install()
+        with patch.object(main, "require_user"), patch.object(main, "backend", return_value=self.engine), \
+                patch.object(metadata, "dlcs", return_value={"state": "unavailable", "dlcs": []}):
+            plugin = main.Plugin()
+            result = asyncio.run(plugin.save_dlc_selection("123", ["654"]))
+            self.assertTrue(result["success"])
+            first = asyncio.run(plugin.get_game_page("123"))
+            second = asyncio.run(plugin.get_game_page("456"))
+            self.assertEqual(["654"], first["record"]["enabled_dlc_ids"])
+            self.assertEqual("pending", second["record"]["launch_setup"])
+            self.assertEqual("unavailable", asyncio.run(plugin.get_game_metadata("123"))["state"])
+            acknowledged = asyncio.run(plugin.acknowledge_launch_setup("456"))
+            self.assertTrue(acknowledged["success"])
+            self.assertEqual(["789"], acknowledged["record"]["enabled_dlc_ids"])
+        self.assertEqual("installed", self.engine.status("123")[0])
 
     def test_restart_recovery_of_interrupted_install(self):
         record = self.install()
@@ -1944,9 +2289,40 @@ class MetadataTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 vdf_lite.parse(text)
 
-    def test_network_failures_mean_zero_dlc(self):
+    def test_network_failures_are_unavailable_not_zero_dlc(self):
         with patch.object(metadata, "fetch", side_effect=OSError("offline")):
-            self.assertEqual([], metadata.lookup("123"))
+            self.assertEqual({"state": "unavailable", "dlcs": []}, asyncio.run(metadata.dlcs("123")))
+
+    def test_metadata_deadline_returns_without_waiting_for_worker(self):
+        started, release = threading.Event(), threading.Event()
+        def slow(value):
+            started.set()
+            release.wait(2)
+            return []
+        async def check():
+            with patch.object(metadata, "lookup", side_effect=slow):
+                try:
+                    result = await asyncio.wait_for(metadata.dlcs("123", deadline=0.02), 0.5)
+                    self.assertTrue(started.is_set())
+                    self.assertEqual("unavailable", result["state"])
+                finally:
+                    release.set()
+        asyncio.run(check())
+
+    def test_successful_empty_metadata_is_available(self):
+        with patch.object(metadata, "fetch", return_value={"123": {"success": True, "data": {}}}):
+            self.assertEqual({"state": "ready", "dlcs": []}, asyncio.run(metadata.dlcs("123")))
+
+    def test_local_status_never_waits_for_metadata(self):
+        instance = types.SimpleNamespace(status=lambda value: ("installed", {"enabled_dlc_ids": ["456"]}),
+                                         store=types.SimpleNamespace(allowlist=lambda: ["123"]))
+        with patch.object(main, "backend", return_value=instance), \
+                patch.object(steam_library, "find_game", return_value={"name": "Fake", "game_directory": "fake"}), \
+                patch.object(main, "available_proxies", return_value=[]), \
+                patch.object(metadata, "dlcs", side_effect=AssertionError("network on local status")):
+            result = asyncio.run(main.Plugin().get_game_page("123"))
+        self.assertTrue(result["found"])
+        self.assertEqual([{"id": "456", "name": "DLC 456"}], result["dlcs"])
 
     def test_web_only_store_fallback(self):
         with patch.object(metadata, "fetch", side_effect=[{"data": {"123": {"common": {"name": "Example"}}}}, {"123": {"data": {"dlc": [456]}}}]):
