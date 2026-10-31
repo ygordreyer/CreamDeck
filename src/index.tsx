@@ -1,20 +1,24 @@
 import { routerHook } from "@decky/api";
-import { ButtonItem, definePlugin, Navigation, Router, staticClasses } from "@decky/ui";
+import { ButtonItem, definePlugin, Navigation, PanelSection, PanelSectionRow, Router, staticClasses } from "@decky/ui";
 import { useEffect, useState } from "react";
 import { FaUnlock as PluginIcon } from "react-icons/fa";
 
-import contextMenuPatch, { LibraryContextMenu, menuPatchAvailable, subscribeMenuPatchStatus } from "./patch";
+import contextMenuPatch, { LibraryContextMenu, menuPatchStatus, reportMenuPatchFailure, subscribeMenuPatchStatus } from "./patch";
 import CreamDeckPage from "./views/CreamDeckPage";
 import { getRecordedGames, RecordedGame } from "./utils/backend";
 
 const ROUTE = "/creamdeck-hardened/:appid";
 
 function QuickAccessContent() {
-  const [available, setAvailable] = useState(menuPatchAvailable());
+  const [patchStatus, setPatchStatus] = useState(menuPatchStatus());
   const [help, setHelp] = useState(false);
   const [games, setGames] = useState<RecordedGame[]>([]);
   const [listStatus, setListStatus] = useState("Loading recorded games");
-  useEffect(() => subscribeMenuPatchStatus(setAvailable), []);
+  useEffect(() => {
+    const unsubscribe = subscribeMenuPatchStatus(setPatchStatus);
+    setPatchStatus(menuPatchStatus());
+    return unsubscribe;
+  }, []);
   useEffect(() => {
     let mounted = true;
     void getRecordedGames().then((result) => {
@@ -34,24 +38,24 @@ function QuickAccessContent() {
   let running: string | undefined;
   try { running = Router?.MainRunningApp?.appid; } catch { /* Steam may not expose the running-app store. */ }
   const appId = current || (/^[1-9][0-9]{0,9}$/.test(String(running)) ? String(running) : undefined);
-  return <div style={{ padding: "1em", overflowWrap: "anywhere" }}>
-    <ButtonItem disabled={!appId} onClick={() => {
+  return <PanelSection>
+    <PanelSectionRow><ButtonItem layout="below" disabled={!appId} onClick={() => {
       if (appId) { Navigation.CloseSideMenus(); Navigation.Navigate(`/creamdeck-hardened/${appId}`); }
-    }}>Open game</ButtonItem>
-    {!appId && <p>Select or run a game</p>}
-    {!available && <p role="status">Library menu unavailable</p>}
-    {games.map((game) => <ButtonItem key={game.app_id} onClick={() => {
+    }}>Open game</ButtonItem></PanelSectionRow>
+    {!appId && <PanelSectionRow><p style={{ overflowWrap: "anywhere" }}>Select or run a game</p></PanelSectionRow>}
+    {patchStatus === "failed" && <PanelSectionRow><p role="status" style={{ overflowWrap: "anywhere" }}>Library menu unavailable</p></PanelSectionRow>}
+    {games.map((game) => <PanelSectionRow key={game.app_id}><ButtonItem layout="below" onClick={() => {
       Navigation.CloseSideMenus(); Navigation.Navigate(`/creamdeck-hardened/${game.app_id}`);
-    }}>{game.name} ({game.state})</ButtonItem>)}
-    {listStatus && <p role="status">{listStatus}</p>}
-    <ButtonItem onClick={() => setHelp((old) => !old)}>(?)</ButtonItem>
-    {help && <p>Open the selected library game, the running game, or a recorded game. Offline single-player games with no anti-cheat only.</p>}
-  </div>;
+    }}><span style={{ overflowWrap: "anywhere" }}>{game.name} ({game.state})</span></ButtonItem></PanelSectionRow>)}
+    {listStatus && <PanelSectionRow><p role="status" style={{ overflowWrap: "anywhere" }}>{listStatus}</p></PanelSectionRow>}
+    <PanelSectionRow><ButtonItem layout="below" onClick={() => setHelp((old) => !old)}>(?)</ButtonItem></PanelSectionRow>
+    {help && <PanelSectionRow><p style={{ overflowWrap: "anywhere" }}>Open the selected library game, the running game, or a recorded game. Offline single-player games with no anti-cheat only.</p></PanelSectionRow>}
+  </PanelSection>;
 }
 
 export default definePlugin(() => {
   let menuPatch: ReturnType<typeof contextMenuPatch>;
-  try { menuPatch = contextMenuPatch(LibraryContextMenu); } catch { /* QAM remains available. */ }
+  try { menuPatch = contextMenuPatch(LibraryContextMenu); } catch { reportMenuPatchFailure(); }
   try { routerHook.addRoute(ROUTE, CreamDeckPage, { exact: true }); }
   catch (error) { menuPatch?.unpatch(); throw error; }
   return {

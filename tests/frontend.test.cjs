@@ -113,19 +113,26 @@ test("release publication follows build, tests and package verification", () => 
   assert.match(JSON.parse(source("plugin.json")).publish.description, /per-game/i);
 });
 
-function qam({ path = "/routes/library/app/123", running, available = false, games = [], failure = false } = {}) {
+function treeNodes(node, result = []) {
+  if (Array.isArray(node)) node.forEach(child => treeNodes(child, result));
+  else if (node && typeof node === "object") { result.push(node); treeNodes(node.props?.children, result); }
+  return result;
+}
+
+function qam({ path = "/routes/library/app/123", running, available = false, games = [], failure = false, patch } = {}) {
   const navigation = [], slots = [], effects = [], cleanups = [], calls = [];
   let cursor = 0, tree;
   const module = load("src/index.tsx", { window: { location: { pathname: path } }, require(id) {
     if (id === "@decky/api") return { routerHook: { addRoute() {} } };
-    if (id === "@decky/ui") return { ButtonItem: "ButtonItem", definePlugin: fn => fn, staticClasses: {}, Router: { MainRunningApp: running ? { appid: running } : undefined }, Navigation: { CloseSideMenus() {}, Navigate(value) { navigation.push(value); } } };
+    if (id === "@decky/ui") return { ButtonItem: "ButtonItem", PanelSection: "PanelSection", PanelSectionRow: "PanelSectionRow", definePlugin: fn => fn, staticClasses: {}, Router: { MainRunningApp: running ? { appid: running } : undefined }, Navigation: { CloseSideMenus() {}, Navigate(value) { navigation.push(value); } } };
     if (id === "react") return {
       useState(value) { const i = cursor++; if (!(i in slots)) slots[i] = value; return [slots[i], next => { slots[i] = typeof next === "function" ? next(slots[i]) : next; }]; },
       useEffect(fn) { const i = cursor++; if (!(i in slots)) { slots[i] = true; effects.push(fn); } },
     };
     if (id === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
     if (id === "react-icons/fa") return {};
-    if (id === "./patch") return { default: () => undefined, menuPatchAvailable: () => available, subscribeMenuPatchStatus() {} };
+    if (id === "./patch") return patch || { default: () => undefined, menuPatchAvailable: () => available,
+      menuPatchStatus: () => available ? "working" : "unseen", subscribeMenuPatchStatus() {} };
     if (id === "./views/CreamDeckPage") return {};
     if (id === "./utils/backend") return { async getRecordedGames() { calls.push("getRecordedGames"); if (failure) throw Error("read failed"); return { games }; } };
     throw Error(id);
@@ -151,7 +158,7 @@ test("QAM record rows open each recorded game's route without a selected game", 
   assert.match(html, /First game/); assert.match(html, /Installed/);
   assert.match(html, /Second game/); assert.match(html, /Setup pending/);
   assert.doesNotMatch(html, /Invalid game/);
-  const buttons = h.tree.props.children.flat(Infinity).filter(x => x?.type === "ButtonItem" && !["Open game", "(?)"].includes(x.props.children));
+  const buttons = treeNodes(h.tree).filter(x => x.type === "ButtonItem" && !["Open game", "(?)"].includes(x.props.children));
   assert.equal(buttons.length, 2);
   buttons.forEach(button => button.props.onClick());
   assert.deepEqual(h.navigation, ["/creamdeck-hardened/123", "/creamdeck-hardened/456"]);
@@ -161,7 +168,7 @@ test("QAM record rows open each recorded game's route without a selected game", 
 test("QAM empty records show one short status", async () => {
   const h = qam({ path: "/routes/library/home", available: true });
   await h.settle();
-  assert.match(dom(h.tree), /role="status">No recorded games</);
+  assert.ok(treeNodes(h.tree).some(node => node.props.role === "status" && node.props.children === "No recorded games"));
   assert.equal((dom(h.tree).match(/No recorded games/g) || []).length, 1);
   assert.deepEqual(h.calls, ["getRecordedGames"]);
 });
@@ -170,9 +177,10 @@ test("QAM recorded game names and states render only strings", async () => {
   for (const name of [{ unexpected: "object" }, ["nested"], null, 123, "", "  ", "x".repeat(257)]) {
     const h = qam({ games: [{ app_id: "123", name, state: { unexpected: "object" } }] });
     await h.settle();
-    const row = h.tree.props.children.flat(Infinity).find(x => x?.type === "ButtonItem" && Array.isArray(x.props.children));
+    const row = treeNodes(h.tree).find(x => x.type === "ButtonItem" && /Steam app 123/.test(dom(x)));
     assert.ok(row, "recorded game row remains reachable");
-    assert.ok(row.props.children.every(child => typeof child === "string"), "React children must be strings");
+    const label = row.props.children;
+    assert.ok((Array.isArray(label) ? label : label.props.children).every(child => typeof child === "string"), "React label children must be strings");
     assert.match(dom(row), /Steam app 123/);
   }
   const h = qam({ games: [{ app_id: "123", name: "  Trimmed name  ", state: "Installed" }] });
@@ -249,24 +257,230 @@ function dom(node) {
   }
   if (p.style) attrs += ` style="${escape(JSON.stringify(p.style))}"`;
   let content = dom(p.children);
-  if (node.type === "PanelSection") content = `<h2>${escape(p.title)}</h2>` + content;
+  if (node.type === "PanelSection" && p.title) content = `<h2>${escape(p.title)}</h2>` + content;
+  if (node.type === "ButtonItem" && p.layout) attrs += ` data-layout="${escape(p.layout)}"`;
   if (node.type === "ToggleField") return `<label>${escape(p.label)}<input type="checkbox"${attrs}></label>\n`;
   if (node.type === "Dropdown") content = p.rgOptions.map(x => `<option${x.data === p.selectedOption ? ' selected="true"' : ""}>${escape(x.label)}</option>`).join("");
   if (node.type === "Dropdown") attrs += ` aria-label="${escape(p.menuLabel || "")}"`;
   return `<${tag}${attrs}>${content}</${tag}>\n`;
 }
 
-test("QAM opens the current or running game and shows a menu-unavailable fallback", () => {
+test("QAM opens the current or running game", () => {
   for (const [path, running, expected] of [["/routes/library/app/123", "456", "123"], ["/routes/library/home", "456", "456"], ["/routes/library/home", undefined, undefined]]) {
     const h = qam({ path, running });
-    const open = [].concat(h.tree.props.children).find(x => x?.type === "ButtonItem" && x.props.children === "Open game");
+    const open = treeNodes(h.tree).find(x => x.type === "ButtonItem" && x.props.children === "Open game");
     assert.ok(open);
     assert.equal(open.props.disabled, !expected);
     open.props.onClick();
     assert.deepEqual(h.navigation, expected ? [`/creamdeck-hardened/${expected}`] : []);
-    assert.match(dom(h.tree), /Library menu unavailable/);
   }
   assert.doesNotMatch(dom(qam({ available: true }).tree), /Library menu unavailable/);
+});
+
+test("QAM cold open with the patch installed has no false library error", async () => {
+  const patch = menuPatchHarness();
+  const h = qam({ patch: patch.module });
+  assert.doesNotMatch(dom(h.tree), /Library menu unavailable/);
+  await h.settle();
+  patch.outer([], { props: { children: [] } }); await h.settle();
+  assert.doesNotMatch(dom(h.tree), /Library menu unavailable/);
+  patch.hook(); patch.insert(); await h.settle();
+  assert.doesNotMatch(dom(h.tree), /Library menu unavailable/);
+  patch.handle.unpatch(); h.unmount();
+});
+
+test("QAM shows library error when patch installation throws at load", () => {
+  const patch = menuPatchHarness({ install: false, throwAtLoad: true });
+  const h = qam({ patch: patch.module });
+  assert.match(dom(h.tree), /Library menu unavailable/);
+  h.unmount();
+});
+
+test("QAM shows library error when a splice throws and clears it on success", async () => {
+  const patch = menuPatchHarness();
+  const h = qam({ patch: patch.module }); await h.settle();
+  patch.hook(); patch.insert(); await h.settle();
+  assert.doesNotMatch(dom(h.tree), /Library menu unavailable/);
+  const items = Object.freeze([{ props: { onSelected: function launchSource() {} } }]);
+  patch.callbacks[2].callback([], { props: { children: [items] } });
+  await h.settle();
+  assert.match(dom(h.tree), /Library menu unavailable/);
+  patch.outer([], { _owner: { pendingProps: { overview: { appid: 123 } } } });
+  patch.insert(); await h.settle();
+  assert.doesNotMatch(dom(h.tree), /Library menu unavailable/);
+  patch.handle.unpatch(); h.unmount();
+});
+
+test("QAM uses full-width Decky rows without an inline padding wrapper", async () => {
+  const h = qam({ path: "/routes/library/home", games: [
+    { app_id: "123", name: "Remnant: From the Ashes", state: "Installed" },
+    { app_id: "456", name: "x".repeat(256), state: "Setup pending" },
+  ] });
+  await h.settle();
+  assert.equal(h.tree.type, "PanelSection");
+  assert.ok(!treeNodes(h.tree).some(node => Object.keys(node.props?.style || {}).some(key => key.startsWith("padding"))));
+  const buttons = treeNodes(h.tree).filter(node => node.type === "ButtonItem");
+  assert.equal(buttons.length, 4);
+  for (const button of buttons) assert.equal(button.props.layout, "below");
+  assert.ok(buttons[0].props.disabled);
+  assert.match(dom(h.tree), /Select or run a game/);
+  assert.match(dom(buttons[1]), />Remnant: From the Ashes \(Installed\)</);
+  assert.match(dom(buttons[2]), new RegExp(`>${"x".repeat(256)} \\(Setup pending\\)</`));
+  buttons.at(-1).props.onClick(); await h.settle();
+  for (const row of h.tree.props.children.flat(Infinity).filter(Boolean)) {
+    assert.equal(row.type, "PanelSectionRow");
+    for (const paragraph of treeNodes(row).filter(node => node.type === "p")) {
+      assert.equal(paragraph.props.style.overflowWrap, "anywhere");
+    }
+  }
+  assert.match(dom(h.tree), /Open the selected library game, the running game, or a recorded game\. Offline single-player games with no anti-cheat only\./);
+});
+
+for (const discovery of ["missing", "throws"]) {
+  test(`QAM discovery ${discovery} shows library error`, () => {
+    const patch = menuPatchHarness({ install: false, discovery });
+    assert.equal(patch.module.LibraryContextMenu, undefined, "exercise actual single-shot discovery");
+    const h = qam({ patch: patch.module });
+    assert.equal(patch.callbacks.length, 0, "no patch can be installed without the discovered component");
+    assert.match(dom(h.tree), /Library menu unavailable/);
+    h.unmount();
+  });
+}
+
+for (const shape of ["outer", "items"]) {
+  test(`QAM unsupported ${shape} shape shows library error`, async () => {
+    const patch = menuPatchHarness();
+    const h = qam({ patch: patch.module }); await h.settle();
+    if (shape === "outer") {
+      patch.outer([], { _owner: { pendingProps: { overview: { appid: 123 } } } });
+      patch.callbacks[1].callback([], { type: () => null });
+    } else {
+      patch.hook();
+      patch.callbacks[2].callback([], { props: { children: ["changed structure"] } });
+    }
+    await h.settle();
+    assert.match(dom(h.tree), /Library menu unavailable/);
+    patch.handle.unpatch(); h.unmount();
+  });
+}
+
+test("QAM unsupported shape followed by successful splice clears library error", async () => {
+  for (const shape of ["outer", "items"]) {
+    const patch = menuPatchHarness();
+    const h = qam({ patch: patch.module }); await h.settle();
+    patch.hook();
+    if (shape === "outer") patch.callbacks[1].callback([], { type: () => null });
+    else patch.callbacks[2].callback([], { props: { children: [null] } });
+    await h.settle();
+    assert.match(dom(h.tree), /Library menu unavailable/, shape);
+    const entries = patch.insert(); await h.settle();
+    assert.equal(entries.filter(item => item.key === "creamdeck-hardened").length, 1);
+    assert.doesNotMatch(dom(h.tree), /Library menu unavailable/, shape);
+    patch.handle.unpatch(); h.unmount();
+  }
+});
+
+test("QAM unrelated menus preserve an existing library failure", async () => {
+  for (const unrelated of ["missing id", "invalid id", "non-app menu"]) {
+    const patch = menuPatchHarness();
+    const h = qam({ patch: patch.module }); await h.settle();
+    patch.hook(); patch.insert(); await h.settle();
+    assert.doesNotMatch(dom(h.tree), /Library menu unavailable/);
+    patch.callbacks[2].callback([], { props: { children: [Object.freeze([
+      { props: { onSelected: function launchSource() {} } },
+    ])] } });
+    await h.settle();
+    assert.match(dom(h.tree), /Library menu unavailable/);
+    if (unrelated === "non-app menu") {
+      patch.callbacks[2].callback([], { props: { children: [[{ props: { onSelected() {} } }]] } });
+    } else {
+      patch.outer([], unrelated === "missing id" ? { props: { children: [] } }
+        : { _owner: { pendingProps: { overview: { appid: 0 } } } });
+    }
+    await h.settle();
+    assert.match(dom(h.tree), /Library menu unavailable/, unrelated);
+    patch.handle.unpatch(); h.unmount();
+  }
+});
+
+function renderMenuPath(patch, path, items) {
+  if (path === "outer") {
+    patch.outer([], { _owner: { pendingProps: { overview: { appid: 123 } } }, props: { children: items } });
+  } else if (path === "render") {
+    patch.callbacks[2].callback([], { props: { children: [items] } });
+  } else {
+    patch.callbacks[3].callback([{ children: items }], true);
+  }
+}
+
+for (const path of ["render", "outer", "shouldComponentUpdate"]) {
+  test(`QAM unrelated ${path} menu preserves unsupported-shape failure without insertion`, async () => {
+    const patch = menuPatchHarness();
+    const h = qam({ patch: patch.module }); await h.settle();
+    try {
+      patch.hook();
+      patch.callbacks[2].callback([], { props: { children: [null] } });
+      await h.settle();
+      assert.match(dom(h.tree), /Library menu unavailable/, "unsupported library shape must show the warning");
+      const items = [{ props: { onSelected: function openScreenshot() {} } }];
+      renderMenuPath(patch, path, items);
+      await h.settle();
+      assert.match(dom(h.tree), /Library menu unavailable/, "unrelated menu must preserve the visible warning");
+      assert.equal(items.some(item => item.key === "creamdeck-hardened"), false, "unrelated menu must not receive an entry");
+    } finally { patch.handle.unpatch(); h.unmount(); }
+  });
+
+  test(`QAM recognized ${path} menu inserts once and clears library failure`, async () => {
+    const patch = menuPatchHarness();
+    const h = qam({ patch: patch.module }); await h.settle();
+    try {
+      patch.hook();
+      patch.callbacks[2].callback([], { props: { children: [null] } });
+      await h.settle();
+      assert.match(dom(h.tree), /Library menu unavailable/);
+      const items = [{ props: { onSelected: function launchSource() {} } }];
+      for (let repeat = 0; repeat < 2; repeat++) {
+        renderMenuPath(patch, path, items);
+        await h.settle();
+        const entries = items.filter(item => item.key === "creamdeck-hardened");
+        assert.equal(entries.length, 1, "recognized app menu must contain exactly one entry");
+        assert.doesNotMatch(dom(h.tree), /Library menu unavailable/);
+        entries[0].props.onSelected();
+      }
+      assert.deepEqual(patch.navigation, ["/creamdeck-hardened/123", "/creamdeck-hardened/123"]);
+    } finally { patch.handle.unpatch(); h.unmount(); }
+  });
+
+  test(`QAM repeated unrelated and unsupported ${path} menus keep library failure visible`, async () => {
+    const patch = menuPatchHarness();
+    const h = qam({ patch: patch.module }); await h.settle();
+    try {
+      patch.hook();
+      for (let repeat = 0; repeat < 3; repeat++) {
+        patch.callbacks[2].callback([], { props: { children: [null] } });
+        await h.settle();
+        assert.match(dom(h.tree), /Library menu unavailable/, "unsupported render must keep the warning visible");
+        const items = [{ props: { onSelected: function openScreenshot() {} } }];
+        renderMenuPath(patch, path, items);
+        await h.settle();
+        assert.match(dom(h.tree), /Library menu unavailable/, "unrelated render must keep the warning visible");
+        assert.equal(items.some(item => item.key === "creamdeck-hardened"), false);
+      }
+    } finally { patch.handle.unpatch(); h.unmount(); }
+  });
+}
+
+test("QAM recorded-game labels retain anywhere wrapping", async () => {
+  const name = "x".repeat(256);
+  const h = qam({ games: [{ app_id: "123", name, state: "Installed" }] }); await h.settle();
+  function findLabel(node, wraps = false) {
+    if (Array.isArray(node)) return node.some(child => findLabel(child, wraps));
+    if (!node || typeof node !== "object") return node === name && wraps;
+    return findLabel(node.props?.children, wraps || node.props?.style?.overflowWrap === "anywhere");
+  }
+  assert.ok(findLabel(h.tree), "the label or an ancestor explicitly supplies anywhere wrapping");
+  assert.match(dom(h.tree), new RegExp(`${name} \\(Installed\\)`));
+  h.unmount();
 });
 
 test("installed mode is loaded, dropdowns are labeled, and an unavailable proxy gives one blocking reason", async () => {
@@ -596,12 +810,17 @@ test("all patch handles are removed and repeated installation is guarded", () =>
   assert.equal(handles.length, 5);
 });
 
-function menuPatchHarness() {
+function menuPatchHarness({ install = true, throwAtLoad = false, discovery = "found" } = {}) {
   const callbacks = [], status = [], navigation = [];
+  function Library() {}
   const module = load("src/patch.tsx", { require(id) {
     if (id === "@decky/ui") return {
-      afterPatch(object, method, callback) { callbacks.push({ object, method, callback }); return { unpatch() {} }; },
-      findModuleByExport() {},
+      afterPatch(object, method, callback) { if (throwAtLoad) throw Error("patch failed"); callbacks.push({ object, method, callback }); return { unpatch() {} }; },
+      findModuleByExport() {
+        if (discovery === "throws") throw Error("discovery failed");
+        return discovery === "found" ? { sibling: { toString: () => "navigator:" } } : undefined;
+      },
+      fakeRenderComponent() { return { type: Library }; },
       findInTree(items, predicate) {
         return (Array.isArray(items) ? items : [items]).find(predicate);
       },
@@ -613,9 +832,9 @@ function menuPatchHarness() {
     if (id === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }) };
     throw Error(id);
   } });
-  module.subscribeMenuPatchStatus(value => status.push(value));
-  const handle = module.default(function Library() {});
-  const outer = callbacks[0].callback;
+  module.subscribeMenuPatchStatus(value => status.push(typeof value === "boolean" ? value : value === "working"));
+  const handle = install ? module.default(module.LibraryContextMenu) : undefined;
+  const outer = callbacks[0]?.callback;
   function hook() {
     outer([], { _owner: { pendingProps: { overview: { appid: 123 } } } });
     callbacks[1].callback([], { type: { prototype: {} } });
@@ -853,7 +1072,7 @@ test("changed Steam menu structure reports patch unavailable", () => {
   callbacks[2]([], { props: { children: [[{}]] } });
   callbacks[2]([], { props: { children: ["changed structure"] } });
   assert.equal(module.menuPatchAvailable(), false);
-  assert.deepEqual(status, [true, false]);
+  assert.deepEqual(status, ["working", "failed"]);
   handle.unpatch();
 });
 

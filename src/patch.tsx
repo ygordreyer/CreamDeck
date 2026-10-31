@@ -20,17 +20,25 @@ import type { FC } from "react";
 const MENU_ITEM_KEY = "creamdeck-hardened";
 const isValidAppId = (appid: unknown): appid is number =>
   typeof appid === "number" && Number.isSafeInteger(appid) && appid > 0;
-let menuAvailable = false;
-const statusListeners = new Set<(available: boolean) => void>();
-export const menuPatchAvailable = () => menuAvailable;
-export function subscribeMenuPatchStatus(listener: (available: boolean) => void) {
+type MenuPatchStatus = "unseen" | "working" | "failed";
+// A discovered menu that never renders is indistinguishable from a cold open.
+let patchStatus: MenuPatchStatus = "unseen";
+const statusListeners = new Set<(status: MenuPatchStatus) => void>();
+export const menuPatchAvailable = () => patchStatus === "working";
+export const menuPatchStatus = () => patchStatus;
+export const reportMenuPatchFailure = () => setMenuPatchStatus("failed");
+export function subscribeMenuPatchStatus(listener: (status: MenuPatchStatus) => void) {
   statusListeners.add(listener);
   return () => { statusListeners.delete(listener); };
 }
-function setMenuAvailable(available: boolean) {
-  if (menuAvailable === available) return;
-  menuAvailable = available;
-  statusListeners.forEach((listener) => listener(available));
+function setMenuPatchStatus(status: MenuPatchStatus) {
+  if (patchStatus === status) return;
+  patchStatus = status;
+  statusListeners.forEach((listener) => listener(status));
+}
+function menuNotSeen() {
+  // Skipping an unrelated menu must not clear a failure before a successful splice.
+  if (patchStatus !== "failed") setMenuPatchStatus("unseen");
 }
 
 // Always add before "Properties..."
@@ -51,7 +59,7 @@ const spliceMenuItem = (children: any[], appid: number) => {
       CreamDeck Hardened
     </MenuItem>,
   );
-  setMenuAvailable(true);
+  setMenuPatchStatus("working");
 };
 
 // Check if correct menu by looking at the code of the onSelected function.
@@ -61,6 +69,14 @@ const isOpeningAppContextMenu = (items: any[]) => {
     return false;
   }
   return !!findInReactTree(items, (x) => x?.props?.onSelected?.toString().includes("launchSource"));
+};
+
+const canPatchAppMenu = (items: any[], appid: number | undefined): appid is number => {
+  if (!isOpeningAppContextMenu(items) || !isValidAppId(appid)) {
+    menuNotSeen();
+    return false;
+  }
+  return true;
 };
 
 const handleItemDupes = (items: any[]) => {
@@ -99,7 +115,7 @@ const patchMenuItems = (menuItems: any[], appid: number) => {
 let activePatch: { unpatch: () => void } | undefined;
 const contextMenuPatch = (LibraryContextMenu: any) => {
   if (activePatch) return activePatch;
-  if (!LibraryContextMenu?.prototype) { setMenuAvailable(false); return undefined; }
+  if (!LibraryContextMenu?.prototype) { reportMenuPatchFailure(); return undefined; }
   const nested: Patch[] = [];
   const patchedPrototypes = new WeakSet<object>();
   let currentAppId: number | undefined;
@@ -126,7 +142,7 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
     }
     if (!isValidAppId(appid)) {
       currentAppId = undefined;
-      setMenuAvailable(false);
+      menuNotSeen();
       return component;
     }
     currentAppId = appid;
@@ -135,19 +151,19 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
       patches.inner = afterPatch(component, "type", (_: any, ret: any) => {
         try {
         const prototype = ret?.type?.prototype;
-        if (!prototype) { setMenuAvailable(false); return ret; }
+        if (!prototype) { reportMenuPatchFailure(); return ret; }
         if (patchedPrototypes.has(prototype)) return ret;
         patchedPrototypes.add(prototype);
         nested.push(afterPatch(prototype, "render", (_: any, ret2: any) => {
           const menuItems = ret2?.props?.children?.[0];
-          if (!Array.isArray(menuItems)) { setMenuAvailable(false); return ret2; }
-          if (!isOpeningAppContextMenu(menuItems) || !isValidAppId(currentAppId)) { setMenuAvailable(false); return ret2; }
+          if (!Array.isArray(menuItems)) { reportMenuPatchFailure(); return ret2; }
+          if (!canPatchAppMenu(menuItems, currentAppId)) return ret2;
           try {
             handleItemDupes(menuItems);
             patchMenuItems(menuItems, currentAppId);
           } catch (error) {
             currentAppId = undefined;
-            setMenuAvailable(false);
+            reportMenuPatchFailure();
             return ret2;
           }
           return ret2;
@@ -156,13 +172,14 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
         // when Steam decides to refresh the app overview
         nested.push(afterPatch(prototype, "shouldComponentUpdate", ([nextProps]: any, shouldUpdate: any) => {
           try {
-            if (!isValidAppId(currentAppId)) { setMenuAvailable(false); return shouldUpdate; }
+            if (!isValidAppId(currentAppId)) { menuNotSeen(); return shouldUpdate; }
             if (!Array.isArray(nextProps?.children)) return shouldUpdate;
+            if (!canPatchAppMenu(nextProps.children, currentAppId)) return shouldUpdate;
             handleItemDupes(nextProps.children);
             if (shouldUpdate === true) patchMenuItems(nextProps.children, currentAppId);
           } catch (error) {
             currentAppId = undefined;
-            setMenuAvailable(false);
+            reportMenuPatchFailure();
             return shouldUpdate;
           }
 
@@ -170,22 +187,22 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
           return shouldUpdate;
         }));
         return ret;
-        } catch { setMenuAvailable(false); return ret; }
+        } catch { reportMenuPatchFailure(); return ret; }
       });
     } else {
-      if (isValidAppId(currentAppId) && Array.isArray(component?.props?.children)) {
-        try { handleItemDupes(component.props.children); spliceMenuItem(component.props.children, currentAppId); } catch { setMenuAvailable(false); }
+      if (Array.isArray(component?.props?.children) && canPatchAppMenu(component.props.children, currentAppId)) {
+        try { handleItemDupes(component.props.children); spliceMenuItem(component.props.children, currentAppId); } catch { reportMenuPatchFailure(); }
       }
     }
     return component;
-    } catch { setMenuAvailable(false); return component; }
+    } catch { reportMenuPatchFailure(); return component; }
   });
   patches.unpatch = () => {
     if (disposed) return;
     disposed = true;
     for (const patch of nested.splice(0).reverse()) { try { patch.unpatch(); } catch { /* Continue removing all handles. */ } }
     try { patches.inner?.unpatch(); } catch { /* Continue removing all handles. */ }
-    try { patches.outer?.unpatch(); } finally { activePatch = undefined; setMenuAvailable(false); }
+    try { patches.outer?.unpatch(); } finally { activePatch = undefined; setMenuPatchStatus("unseen"); }
   };
   activePatch = patches;
   return patches;
